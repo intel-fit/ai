@@ -1,0 +1,22 @@
+﻿
+
+StatusCode        : 200
+StatusDescription : OK
+Content           : [{"name":"ì ¤ë¦¬ë¸ë¦¬ Applemango ì íë§ê³ ","calories":108.0,"carbs":26.67,"protein":0.0,"fat":0.0,"fiber":0.0,"sugar":25.0,"sodium":58.0,"glycemic_index":50.0,"processing_level":1,"company":"í´ë...
+RawContent        : HTTP/1.1 200 OK
+                    Content-Length: 4622
+                    Content-Type: application/json
+                    Date: Mon, 06 Oct 2025 15:38:46 GMT
+                    Server: uvicorn
+                    
+                    [{"name":"ì ¤ë¦¬ë¸ë¦¬ Applemango ì íë§ê³ ","calories":108.0,"carbs":...
+Forms             : {}
+Headers           : {[Content-Length, 4622], [Content-Type, application/json], [Date, Mon, 06 Oct 2025 15:38:46 GMT], [Server, uvicorn]}
+Images            : {}
+InputFields       : {}
+Links             : {}
+ParsedHtml        : mshtml.HTMLDocumentClass
+RawContentLength  : 4622
+
+
+
