@@ -13,6 +13,14 @@ MUSCLE_KEYWORDS = {
     "core": ["복근", "코어", "복사근", "복직근", "기립근"],
 }
 
+MUSCLE_KEYWORDS.update({
+    "quads": ["대퇴사두근", "앞벅지", "사두"],
+    "hamstrings": ["햄스트링", "뒤벅지"],
+    "glutes": ["둔근", "중둔근", "소둔근", "엉덩이"],
+    "calves": ["비복근", "가자미근", "종아리"],
+    # 기존 legs, core 등은 이미 있음
+})
+
 # 목표별 세트/반복/휴식 파라미터
 GOAL_PARAMS = {
     "fat_loss":     {"reps": (12,20), "sets": (3,4), "rest_sec": (45,75), "intensity": "moderate"},
