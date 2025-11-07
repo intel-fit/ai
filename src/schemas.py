@@ -41,6 +41,9 @@ class UserExerciseContext(BaseModel):
     plan_days: int = Field(ge=1, le=7, default=7)
     inbody: InBodySnapshot = InBodySnapshot()
 
+    target_time_min: Optional[int] = Field(default=None, ge=10, le=180)
+    weight_kg: Optional[float] = Field(default=70.0, ge=30, le=200)
+
 class FoodBase(BaseModel):
     name: str
     calories: float
