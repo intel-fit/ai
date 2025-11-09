@@ -270,6 +270,7 @@ class MealPlanner:
         return base_score
 
 
+
     # ========== 후보 필터 ==========
     def _filter_candidates(self, foods, role, used_foods, daily_counters) -> List[Dict]:
         cands = []
