@@ -200,36 +200,40 @@ async def upload_food(file: UploadFile = File(...), session: Session = Depends(g
     # 5️⃣ Gemini 프롬프트 (한글 + 총중량 포함)
     if len(object_names) > 1:
         prompt = f"""
-        You are a nutrition expert and food recognition specialist.
-        The image was analyzed by Azure Computer Vision.
+        You are a food recognition and nutrition estimation expert.
+        The image below was analyzed by Azure Computer Vision.
         Detected foods: {', '.join(object_names)}
         Tags: {', '.join(tags)}
         Description: {description}
 
-        For each food, return a JSON array with fields:
-        - name (English)
-        - calories, carbs, protein, fat (per 100g)
-        - weight (100)
-        - total_weight (serving size in grams)
-        - total_calories (per serving)
+        Your goal:
+        Estimate the nutritional information for the **entire visible food** in the photo,
+        not per serving — but for the total portion in the image.
 
-        Example:
+        For each food detected, return a JSON array containing:
         [
           {{
-            "name": "Grilled Salmon",
-            "calories": 208,
-            "carbs": 0,
-            "protein": 20,
-            "fat": 13,
-            "weight": 100,
-            "total_weight": 180,
-            "total_calories": 374
+            "name": "Fried Chicken",
+            "calories": 250,           # per 100g
+            "carbs": 10,
+            "protein": 22,
+            "fat": 14,
+            "weight": 100,             # base unit
+            "total_weight": 980,       # total weight visible in the image (grams)
+            "total_calories": 2450     # total calories for that visible portion
           }}
         ]
+
+        Rules:
+        - Provide reasonable estimates for the total visible portion in grams.
+        - If the food is clearly a single portion (like one hamburger), estimate the total burger weight.
+        - If it’s a shared food (like fried chicken pieces), sum all visible items.
+        - Do NOT use “per serving” — use the **photo total**.
         """
+
     else:
         prompt = f"""
-        You are a nutrition expert and food recognition specialist.
+        You are a food recognition and nutrition estimation expert.
 
         Azure Computer Vision detected:
         - Description: {description}
@@ -237,20 +241,30 @@ async def upload_food(file: UploadFile = File(...), session: Session = Depends(g
         - Objects: {', '.join(object_names)}
         - Categories: {', '.join(categories)}
 
-        Estimate the food's English name, nutrients per 100g, and a typical serving size.
+        Estimate:
+        1. The food name in English.
+        2. Nutritional values per 100g.
+        3. The **total visible portion** in the image (total_weight, in grams).
+        4. The total calories for that visible portion.
 
-        Return this JSON:
+        Return strictly as JSON:
         {{
-        "name": "Grilled Salmon",
-        "calories": 208,
-        "carbs": 0,
-        "protein": 20,
-        "fat": 13,
+        "name": "Korean Fried Chicken",
+        "calories": 290,
+        "carbs": 15,
+        "protein": 25,
+        "fat": 18,
         "weight": 100,
-        "total_weight": 180,
-        "total_calories": 374
+        "total_weight": 950,
+        "total_calories": 2755
         }}
+
+        Rules:
+        - total_weight = estimated total visible amount in the photo (grams).
+        - total_calories = total calories for that portion.
+        - Do NOT assume one serving (no “1인분”). Estimate the real total portion size shown.
         """
+
 
     # 6️⃣ Gemini 호출
     headers = {"Content-Type": "application/json", "X-goog-api-key": GEMINI_API_KEY}
@@ -324,8 +338,9 @@ async def upload_food(file: UploadFile = File(...), session: Session = Depends(g
             "protein": f.protein,
             "fat": f.fat,
             "weight": f.weight,
-            "total_weight": getattr(f, "total_weight", 350),
-            "total_calories": round(f.calories * (getattr(f, "total_weight", 350) / (f.weight or 100.0)), 2)
+            "total_weight": getattr(f, "total_weight", None),  # ✅ AI가 준 값
+            "total_calories": getattr(f, "total_calories", None)  # ✅ AI가 준 값
+
         }
         for f in saved_foods
     ]
@@ -442,65 +457,63 @@ async def add_food_to_meal(
             # 5️⃣ Gemini 프롬프트 (다중 음식 대응)
             if len(objects) > 1:
                 prompt = f"""
-                너는 한국 음식을 포함한 전 세계 요리에 대한 영양 전문가이자 음식 인식 전문가야.
+                You are a food recognition and nutrition estimation expert.
+                The image was analyzed by Azure Computer Vision.
+                Detected foods: {', '.join(objects)}
+                Tags: {', '.join(tags)}
+                Description: {description}
 
-                이 이미지는 Azure Computer Vision으로 분석된 음식 사진이야.
-                감지된 음식 객체 목록: {', '.join(objects)}
-                태그: {', '.join(tags)}
-                설명: {description}
+                Estimate the total visible portion (not per serving) for each food detected.
+                Return a JSON array with the following fields:
 
-                각 음식에 대해 다음 정보를 추정해서 JSON 배열로 반환해줘:
-                ```json
                 [
                   {{
-                    "name": "음식명 (한국어)",
-                    "calories": 0,
-                    "carbs": 0,
-                    "protein": 0,
-                    "fat": 0,
+                    "name": "Fried Chicken",
+                    "calories": 250,      # per 100g
+                    "carbs": 10,
+                    "protein": 22,
+                    "fat": 14,
                     "weight": 100,
-                    "total_weight": 0,
-                    "total_calories": 0
+                    "total_weight": 980,  # total visible weight (g)
+                    "total_calories": 2450
                   }}
                 ]
-                ```
-                규칙:
-                - 모든 음식 이름은 반드시 한국어로.
-                - 영양성분은 100g 기준으로 작성.
-                - total_weight는 1인분 기준 (예: 밥 250g, 김치찌개 350g 등).
-                - total_calories는 1인분 기준 총 칼로리.
+
+                Rules:
+                - total_weight: estimated **actual total weight of food visible in the image (grams)**.
+                - total_calories: total calories for that full portion.
+                - Do not assume one serving or 350g. Use the real portion visible in the image.
                 """
             else:
                 prompt = f"""
-                너는 한국 음식을 포함한 전 세계 요리에 대한 영양 전문가이자 음식 인식 전문가야.
+                You are a food recognition and nutrition estimation expert.
 
-                다음은 Azure Computer Vision의 분석 결과야:
-                - 설명: {description}
-                - 태그: {', '.join(tags)}
-                - 감지된 객체: {', '.join(objects)}
-                - 카테고리: {', '.join(categories)}
+                Azure Computer Vision detected:
+                - Description: {description}
+                - Tags: {', '.join(tags)}
+                - Objects: {', '.join(objects)}
+                - Categories: {', '.join(categories)}
 
-                이를 기반으로 실제 음식의 이름(한국어로),
-                100g 기준 영양성분, 그리고 1인분 기준 총중량(total_weight)을 추정해.
+                Estimate the food's name (in English),
+                nutrients per 100g,
+                and the total visible amount of food in the image.
 
-                반드시 아래 JSON 형식으로 반환해:
-                ```json
+                Return JSON like:
                 {{
-                  "name": "음식명 (한국어)",
-                  "calories": 0,
-                  "carbs": 0,
-                  "protein": 0,
-                  "fat": 0,
-                  "weight": 100,
-                  "total_weight": 0,
-                  "total_calories": 0
+                "name": "Korean Fried Chicken",
+                "calories": 290,
+                "carbs": 15,
+                "protein": 25,
+                "fat": 18,
+                "weight": 100,
+                "total_weight": 950,
+                "total_calories": 2755
                 }}
-                ```
-                규칙:
-                - name은 반드시 한국어로 (예: 햄버거, 비빔밥, 된장찌개).
-                - weight는 100g 기준.
-                - total_weight는 1인분 기준 추정.
-                - total_calories는 1인분 기준 총 칼로리.
+
+                Rules:
+                - total_weight = estimated total visible portion in the photo (grams).
+                - total_calories = total calories for that total portion.
+                - Do not use a fixed serving size (like 350g); base it on the photo.
                 """
 
             headers = {"Content-Type": "application/json", "X-goog-api-key": GEMINI_API_KEY}
@@ -535,7 +548,7 @@ async def add_food_to_meal(
                     weight=first.get("weight", 100.0)
                 )
                 # ⬇️ AI가 준 1인분 총중량(없으면 350g)
-                ai_total_weight = float(first.get("total_weight", 350))
+                ai_total_weight = float(first.get("total_weight")) if first.get("total_weight") else None
             else:
                 food_item = db.Food(
                     name=result.get("name", "Unknown"),
@@ -547,16 +560,28 @@ async def add_food_to_meal(
                     weight=result.get("weight", 100.0)
                 )
                 # ⬇️ AI가 준 1인분 총중량(없으면 350g)
-                ai_total_weight = float(first.get("total_weight", 350))
+                ai_total_weight = float(first.get("total_weight")) if first.get("total_weight") else None
 
             session.add(food_item)
             session.commit()
             session.refresh(food_item)
 
-            # ⬇️ AI 1인분 총칼로리 계산
-            #    (100g 기준 칼로리 × (AI총중량 / 기준무게))
-            base_w = food_item.weight or 100.0
-            ai_total_calories = round(float(food_item.calories) * (ai_total_weight / base_w), 2)
+            if isinstance(result, list):
+                first = result[0]
+                ai_total_calories = (
+                    float(first.get("total_calories"))
+                    if first.get("total_calories")
+                    else round(float(food_item.calories) * (ai_total_weight / (food_item.weight or 100.0)), 2)
+                    if ai_total_weight else None
+                )
+            else:
+                ai_total_calories = (
+                    float(result.get("total_calories"))
+                    if result.get("total_calories")
+                    else round(float(food_item.calories) * (ai_total_weight / (food_item.weight or 100.0)), 2)
+                    if ai_total_weight else None
+                )
+
 
             print(f"[AI 1인분] {food_item.name} : {ai_total_weight} g ≈ {ai_total_calories} kcal")
 
