@@ -143,6 +143,8 @@ async def upload_food(file: UploadFile = File(...), session: Session = Depends(g
     """
     # 1️⃣ 이미지 읽기
     img_bytes = await file.read()
+    if not img_bytes or len(img_bytes) < 1024:
+        raise HTTPException(status_code=400, detail="Empty or invalid image file (0 bytes)")
 
     # 2️⃣ 이미지 캐싱용 해시 계산 (SHA256)
     img_hash = hashlib.sha256(img_bytes).hexdigest()
@@ -169,12 +171,23 @@ async def upload_food(file: UploadFile = File(...), session: Session = Depends(g
     # 3️⃣ 리사이즈 (너무 큰 이미지 비용 절감)
     try:
         image = Image.open(BytesIO(img_bytes))
-        image.thumbnail((800, 800))  # 최대 800px로 축소
+        if image.mode in ("RGBA", "P"):
+            image = image.convert("RGB")  # ✅ RGBA, P 모드 모두 JPEG 가능하게 변환
+        image.thumbnail((800, 800))
+
         buffer = BytesIO()
         image.save(buffer, format="JPEG", quality=90)
         img_bytes = buffer.getvalue()
+        buffer.close()
+        del image
+
     except Exception as e:
         print(f"[WARN] Image resize skipped: {e}")
+
+    print(f"[DEBUG] Uploaded file name: {file.filename}")
+    print(f"[DEBUG] Uploaded file type: {file.content_type}")
+    print(f"[DEBUG] Byte size before Azure: {len(img_bytes)}")
+
 
     # 4️⃣ Azure Vision 요청 (다중 visualFeatures)
     headers = {"Ocp-Apim-Subscription-Key": AZURE_CV_KEY, "Content-Type": "application/octet-stream"}
@@ -328,6 +341,12 @@ async def upload_food(file: UploadFile = File(...), session: Session = Depends(g
             saved_foods.append(food_item)
 
     session.commit()
+    print(f"[DEBUG] Uploaded file name: {file.filename}")
+    print(f"[DEBUG] Uploaded file type: {file.content_type}")
+
+    
+
+
     return {
     "ai_result": [
         {
@@ -355,7 +374,8 @@ async def add_food_to_meal(
     
     user_id: str = Form(...),
     date: str = Form(...),
-    quantity_g: float = Form(..., gt=0),
+    quantity_g: float | None = Form(None, gt=0),
+    servings: float | None = Form(None, gt=0),
     meal_id: int | None = Form(None),
     food_id: int | None = Form(None),
     manual_food: str | None = Form(None),
@@ -417,6 +437,8 @@ async def add_food_to_meal(
     elif file:
         # 1️⃣ 이미지 읽기
         img_bytes = await file.read()
+        if not img_bytes or len(img_bytes) < 1024:
+            raise HTTPException(status_code=400, detail="Empty or invalid image file (0 bytes)")
 
         # 2️⃣ 해시 캐싱 (같은 사진 여러 번 올릴 때 API 중복 방지)
         img_hash = hashlib.sha256(img_bytes).hexdigest()
@@ -432,6 +454,9 @@ async def add_food_to_meal(
                 buffer = BytesIO()
                 image.save(buffer, format="JPEG", quality=90)
                 img_bytes = buffer.getvalue()
+                buffer.close()
+                del image
+
             except Exception as e:
                 print(f"[WARN] 이미지 리사이즈 스킵: {e}")
 
@@ -588,6 +613,26 @@ async def add_food_to_meal(
         # ✅ 요약 재계산 훅
         recompute_daily_summaries(user_id, meal.date, session)
 
+    base_weight = getattr(food_item, "serving_size_g", None) or food_item.weight or 100.0
+
+    # 두 값 모두 입력 시 오류
+    if quantity_g and servings:
+        raise HTTPException(status_code=400, detail="Please provide only one of 'quantity_g' or 'servings', not both.")
+
+    # 두 값 모두 비어 있으면 → 기본값: 1인분 기준
+    if not quantity_g and not servings:
+        servings = 1
+        quantity_g = base_weight
+
+    # 인분 입력 시 → 중량 자동 계산
+    elif servings and not quantity_g:
+        quantity_g = servings * base_weight
+
+    # 중량 입력 시 → 인분 자동 계산
+    elif quantity_g and not servings:
+        servings = quantity_g / base_weight
+
+
 
 
     # 3️⃣ MealItem 추가
@@ -596,11 +641,18 @@ async def add_food_to_meal(
     session.commit()
     session.refresh(meal_item)
 
+    # ✅ ratio 계산
+    ratio = quantity_g / (getattr(food_item, "serving_size_g", None) or food_item.weight or 100.0)
+
+
     # ✅ 요약 재계산 훅
     recompute_daily_summaries(user_id, meal.date, session)
 
     # ✅ 실제 섭취량 비율 계산 (조회 로직과 동일하게)
-    ratio = quantity_g / (food_item.weight or 100.0)
+    # ✅ 섭취량 계산 로직 (serving_size_g 반영)
+    # ✅ 섭취량 계산 (중량 or 인분 중 하나만 입력)
+    # ✅ 섭취량 계산 (서빙 단위 연동 및 기본값 처리)
+    
 
     # ✅ 음식 전체 영양정보 반환
     return {
@@ -616,6 +668,10 @@ async def add_food_to_meal(
             "protein_per_100g": food_item.protein,
             "fat_per_100g": food_item.fat,
             "base_weight": food_item.weight,
+            "serving_size_g": base_weight,        # ✅ 1인분 기준 중량
+            "servings": round(servings, 2),       # ✅ 실제 인분 수
+            "quantity_g": round(quantity_g, 1),   # ✅ 실제 g 단위 중량
+
             # ⬇️ 여기 추가: AI 1인분 기준(파일 업로드로 추가했을 때만 값이 있음)
             "total_weight": ai_total_weight,      # 예: 350.0 또는 None
             "total_calories": ai_total_calories,  # 예: 1120.0 또는 None

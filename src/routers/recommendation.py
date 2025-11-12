@@ -2,14 +2,17 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from datetime import datetime
-import random
 from src import db
 from src.services import nutrition
-
-
+from src.services.ai_meal_generator_gemini import generate_realistic_meal_plan
+import json
+import random
 
 router = APIRouter(tags=["Meal Recommendation"])
 
+# ----------------------------------------------------------
+# DB 연결
+# ----------------------------------------------------------
 def get_db():
     session = db.SessionLocal()
     try:
@@ -17,142 +20,130 @@ def get_db():
     finally:
         session.close()
 
+
+# ----------------------------------------------------------
+# 🍱 AI 식단 추천 (일일 / 주간, 프론트 호환 유지)
+# ----------------------------------------------------------
 @router.post("/recommend_daily_meal", response_model=dict)
 def recommend_daily_meal(
     user_id: str,
     meals_per_day: int = 3,
     goal: str = "maintain",
-    preferred_foods: list[int] | None = None,
-    excluded_foods: list[int] | None = None,
+    period: str = "daily",                       # ✅ 일일 / 주간 식단 선택 가능
+    excluded_foods: list[str] | None = None,     # ✅ 프론트에서 X 버튼 누른 음식
     session: Session = Depends(get_db)
 ):
+    """
+    현실적인 AI 식단 추천 (Gemini 기반)
+    - 기존 recommend_daily_meal 구조 유지
+    - 일일 / 주간 식단 모두 지원
+    - 선호/비선호 음식 자동 반영
+    """
+
     # 1️⃣ 사용자 조회
     user = session.query(db.User).filter_by(id=user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # 2️⃣ BMR/TDEE 계산
-    if user.body_fat is not None:
+    # 2️⃣ BMR / TDEE 계산
+    if user.body_fat:
         bmr = nutrition.calculate_bmr_katch_mcardle(user.weight, user.body_fat)
     else:
         bmr = nutrition.calculate_bmr_harris_benedict(user.weight, user.height, user.age, user.sex)
 
     tdee = nutrition.calculate_tdee(bmr, getattr(user, "activity_level", 1.2))
+    goal = getattr(user, "goal", goal)
     target_kcal = nutrition.calculate_goal_calories(tdee, goal)
 
-    # 3️⃣ 목표 매크로 계산
     protein_target, fat_target, carbs_target = nutrition.calculate_macros(
         user.weight, target_kcal, goal, getattr(user, "skeletal_muscle", None)
     )
 
-    # 4️⃣ 끼니별 목표
-    meal_ratios = [1/meals_per_day]*meals_per_day
-    meal_targets = []
-    for i, ratio in enumerate(meal_ratios):
-        meal_targets.append({
-            "meal_type": f"meal_{i+1}",
-            "target_calories": target_kcal * ratio,
-            "target_protein": protein_target * ratio,
-            "target_fat": fat_target * ratio,
-            "target_carbs": carbs_target * ratio
-        })
+    # 3️⃣ 선호 / 비선호 음식 로드
+    preferred_foods, disliked_foods = [], []
 
-    # 5️⃣ DB에서 음식 불러오기
-    query = session.query(db.Food)
+    if hasattr(user, "preferred_foods") and user.preferred_foods:
+        if isinstance(user.preferred_foods, str):
+            try:
+                preferred_foods = json.loads(user.preferred_foods)
+            except Exception:
+                preferred_foods = [user.preferred_foods]
+        elif isinstance(user.preferred_foods, list):
+            preferred_foods = user.preferred_foods
+
+    if hasattr(user, "excluded_foods") and user.excluded_foods:
+        if isinstance(user.excluded_foods, str):
+            try:
+                disliked_foods = json.loads(user.excluded_foods)
+            except Exception:
+                disliked_foods = [user.excluded_foods]
+        elif isinstance(user.excluded_foods, list):
+            disliked_foods = user.excluded_foods
+
+    # 프론트 입력(제외 음식) 반영
     if excluded_foods:
-        query = query.filter(~db.Food.id.in_(excluded_foods))
-    all_foods = query.all()
-    if not all_foods:
-        raise HTTPException(status_code=404, detail="No foods available in database")
+        disliked_foods = list(set(disliked_foods + excluded_foods))
 
-    # 6️⃣ 선호 음식
-    preferred_foods_data = []
-    if preferred_foods:
-        preferred_foods_data = session.query(db.Food).filter(db.Food.id.in_(preferred_foods)).all()
+    # 4️⃣ 맞춤 코멘트 생성
+    prefer_str = ", ".join(preferred_foods) if preferred_foods else ""
+    dislike_str = ", ".join(disliked_foods) if disliked_foods else ""
+    user_name = getattr(user, "name", user_id)
 
-    # 7️⃣ 끼니별 식단 구성 (단백질 우선 + 칼로리 균형 최적화)
-    daily_plan = []
-    remaining_foods = all_foods.copy()
+    if prefer_str and dislike_str:
+        comment_line = f"{user_name}님은 {dislike_str}을(를) 피하고 {prefer_str}을(를) 선호하는 분이에요."
+    elif dislike_str:
+        comment_line = f"{user_name}님은 {dislike_str}을(를) 피하는 분이에요."
+    elif prefer_str:
+        comment_line = f"{user_name}님은 {prefer_str}을(를) 선호하는 분이에요."
+    else:
+        comment_line = f"{user_name}님의 개인 맞춤 식단 추천입니다."
 
-    for meal in meal_targets:
-        target_cals = meal["target_calories"]
-        target_prot = meal["target_protein"]
-        target_fat = meal["target_fat"]
-        target_carbs = meal["target_carbs"]
+    custom_comment = f"🍽️ {comment_line}\n아래는 {'일일' if period=='daily' else '주간'} 식단 추천입니다."
 
-        selected_foods = []
-        total_cal = total_prot = total_fat = total_carbs = 0
+    # 5️⃣ Gemini 기반 식단 생성
+    ai_plan = generate_realistic_meal_plan(
+        user=user,
+        tdee=target_kcal,
+        macros={"protein": protein_target, "fat": fat_target, "carb": carbs_target},
+        meals_per_day=meals_per_day,
+        preferred_foods=preferred_foods,
+        excluded_foods=disliked_foods,
+    )
 
-        while remaining_foods and total_cal < target_cals * 0.95:
-            # 단백질 부족 우선 후보군
-            prot_deficit = target_prot - total_prot
-            high_prot_foods = [f for f in remaining_foods if f.protein and (f.protein <= prot_deficit*1.2)]
-            candidates = high_prot_foods or remaining_foods
+    # 6️⃣ 주간 모드 지원
+    if period == "weekly":
+        ai_plan["request_type"] = "weekly"
+        ai_plan["days"] = [
+            {
+                "day": f"Day {i+1}",
+                "meals": ai_plan.get("meals", []),
+            }
+            for i in range(7)
+        ]
+        # 중복 최소화 처리
+        all_foods = []
+        for d in ai_plan["days"]:
+            for meal in d["meals"]:
+                for f in meal["foods"]:
+                    all_foods.append(f["name"])
+        unique_foods = list(set(all_foods))
+        random.shuffle(unique_foods)
+        for i, d in enumerate(ai_plan["days"]):
+            for meal in d["meals"]:
+                for f in meal["foods"]:
+                    if unique_foods:
+                        f["name"] = unique_foods[(i + hash(f["name"])) % len(unique_foods)]
 
-            # 선호 음식 포함 확률 40%
-            if preferred_foods_data and random.random() < 0.4:
-                food = random.choice(preferred_foods_data)
-            else:
-                food = random.choice(candidates)
-
-            if food in selected_foods:
-                continue
-
-            # 추가 후 목표 초과 방지
-            new_cal = total_cal + (food.calories or 0)
-            new_fat = total_fat + (food.fat or 0)
-            new_carbs = total_carbs + (food.carbs or 0)
-
-            if new_cal > target_cals * 1.05:
-                remaining_foods.remove(food)
-                continue
-            if new_fat > target_fat * 1.05:
-                remaining_foods.remove(food)
-                continue
-            if new_carbs > target_carbs * 1.05:
-                remaining_foods.remove(food)
-                continue
-
-            selected_foods.append(food)
-            total_cal = new_cal
-            total_prot += food.protein or 0
-            total_fat = new_fat
-            total_carbs = new_carbs
-
-            if len(selected_foods) >= 5:
-                break
-
-        daily_plan.append({
-            "meal_type": meal["meal_type"],
-            "target_calories": round(target_cals,1),
-            "actual_calories": round(total_cal,1),
-            "target_protein": round(target_prot,1),
-            "actual_protein": round(total_prot,1),
-            "target_fat": round(target_fat,1),
-            "actual_fat": round(total_fat,1),
-            "target_carbs": round(target_carbs,1),
-            "actual_carbs": round(total_carbs,1),
-            "foods": [
-                {
-                    "id": f.id,
-                    "name": f.name,
-                    "calories": f.calories,
-                    "protein": f.protein,
-                    "fat": f.fat,
-                    "carbs": f.carbs
-                } for f in selected_foods
-            ]
-        })
-
-    # 8️⃣ 반환
+    # 7️⃣ 프론트 호환형 반환 구조
     return {
         "date": datetime.now().strftime("%Y-%m-%d"),
         "user_id": user_id,
         "goal": goal,
         "meals_per_day": meals_per_day,
-        "target_daily_calories": round(target_kcal,1),
-        "target_protein": round(protein_target,1),
-        "target_fat": round(fat_target,1),
-        "target_carbs": round(carbs_target,1),
-        "meals": daily_plan
+        "target_daily_calories": round(target_kcal, 1),
+        "target_protein": round(protein_target, 1),
+        "target_fat": round(fat_target, 1),
+        "target_carbs": round(carbs_target, 1),
+        "comment": custom_comment.strip(),
+        "ai_meal_plan": ai_plan,     # ✅ AI 식단 전체 구조 추가 (기존 meals 대체)
     }
