@@ -15,6 +15,8 @@ from src.routers import score_trend
 from src.routers import exercise_ai
 from src.routers import exercise_score
 from src.routers import exercise_feedback
+from src.routers.home_feedback import router as home_feedback_router
+from src.routers import home 
 
 
 
@@ -62,6 +64,8 @@ app.include_router(score_trend.router)
 app.include_router(exercise_ai.router)
 app.include_router(exercise_score.router)
 app.include_router(exercise_feedback.router)
+app.include_router(home_feedback_router)
+app.include_router(home.router) 
 
 
 if __name__ == "__main__":

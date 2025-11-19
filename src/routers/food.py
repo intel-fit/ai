@@ -3,14 +3,14 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from src import db
 from src.usda_api import search_usda_food
-from src.schemas import FoodOut
+from src.schemas import FoodOut, MealLogOut, MealItemOut
 import os
 import json
 import re
 import requests
 from dotenv import load_dotenv
 from datetime import datetime
-from typing import List
+from typing import List,  Optional
 # 맨 위에 추가
 from src.services.summary import recompute_daily_summaries
 import hashlib
@@ -377,6 +377,8 @@ async def add_food_to_meal(
     quantity_g: float | None = Form(None, gt=0),
     servings: float | None = Form(None, gt=0),
     meal_id: int | None = Form(None),
+    meal_name: str | None = Form(None),   # 프론트에서 주는 끼니 이름
+    time_taken: str | None = Form(None),  # 끼니 먹은 시간
     food_id: int | None = Form(None),
     manual_food: str | None = Form(None),
     file: UploadFile | None = File(None),
@@ -385,25 +387,51 @@ async def add_food_to_meal(
     ai_total_weight: float | None = None
     ai_total_calories: float | None = None
     # 1️⃣ 끼니 선택 or 생성
+    # 1️⃣ 끼니 선택 또는 생성
     if meal_id:
         meal = session.query(db.MealLog).filter_by(id=meal_id, user_id=user_id).first()
         if not meal:
             raise HTTPException(status_code=404, detail="Meal ID not found")
+
+        # 시간 수정 요청이 있을 경우 업데이트
+        if time_taken:
+            meal.time_taken = time_taken
+            session.commit()
+
     else:
+        if not meal_name:
+            raise HTTPException(status_code=400, detail="meal_name is required when meal_id is not provided.")
+
         meal_date = datetime.strptime(date, "%Y-%m-%d").date()
-        last_meal = (
+
+        # 같은 날짜 + 같은 이름의 끼니 있는지 확인
+        meal = (
             session.query(db.MealLog)
-            .filter_by(user_id=user_id, date=meal_date)
-            .order_by(db.MealLog.meal_number.desc())
+            .filter_by(user_id=user_id, date=meal_date, meal_name=meal_name)
             .first()
         )
-        next_number = 1 if not last_meal else last_meal.meal_number + 1
-        meal = db.MealLog(user_id=user_id, date=meal_date, meal_number=next_number)
-        session.add(meal)
-        session.commit()
-        session.refresh(meal)
-        # ✅ 요약 재계산 훅
-        recompute_daily_summaries(user_id, meal.date, session)
+
+        # 없으면 새로 생성
+        if not meal:
+            meal = db.MealLog(
+                user_id=user_id,
+                date=meal_date,
+                meal_name=meal_name,
+                time_taken=time_taken,     # 새로 생성이면 같이 저장
+            )
+            session.add(meal)
+            session.commit()
+            session.refresh(meal)
+
+        else:
+            # 끼니는 있는데 시간만 새로 들어온 경우 → 업데이트
+            if time_taken:
+                meal.time_taken = time_taken
+                session.commit()
+
+    # 끼니 정보 디버깅
+    print(f"[Meal] id={meal.id}, name={meal.meal_name}, time={meal.time_taken}")
+
 
     # 2️⃣ 음식 처리
     food_item = None
@@ -657,7 +685,8 @@ async def add_food_to_meal(
     # ✅ 음식 전체 영양정보 반환
     return {
         "meal_id": meal.id,
-        "meal_number": meal.meal_number,
+        "meal_name": meal.meal_name,
+        "time_taken": meal.time_taken,
         "food_added": {
             "id": food_item.id,
             "name": food_item.name,
@@ -685,35 +714,27 @@ async def add_food_to_meal(
     }
 
 
-# ----------------------
-# 끼니 조회
-# ----------------------
-class MealItemOut(BaseModel):
-    food_id: int
-    food_name: str
-    quantity_g: float
-    calories: float
-    carbs: float
-    protein: float
-    fat: float
 
-class MealLogOut(BaseModel):
-    meal_id: int
-    meal_number: int
-    items: List[MealItemOut]
 
 @router.get("/get_meals", response_model=List[MealLogOut])
 def get_meals(user_id: str, date: str, session: Session = Depends(get_db)):
     meal_date = datetime.strptime(date, "%Y-%m-%d").date()
-    meals = session.query(db.MealLog).filter_by(user_id=user_id, date=meal_date).order_by(db.MealLog.meal_number).all()
+    meals = session.query(db.MealLog)\
+    .filter_by(user_id=user_id, date=meal_date)\
+    .order_by(db.MealLog.meal_name.asc())\
+    .all()
+
     result = []
 
     for meal in meals:
         items_out = []
         for mi in meal.items:
             food = session.query(db.Food).get(mi.food_id)
-            ratio = mi.quantity_g / (food.weight or 100.0)  # ✅ 실제 섭취량 비율 계산
+            base_weight = food.weight or 100.0
+            ratio = mi.quantity_g / base_weight
+
             items_out.append(MealItemOut(
+                meal_item_id=mi.id,
                 food_id=food.id,
                 food_name=food.name,
                 quantity_g=mi.quantity_g,
@@ -724,9 +745,95 @@ def get_meals(user_id: str, date: str, session: Session = Depends(get_db)):
             ))
         result.append(MealLogOut(
             meal_id=meal.id,
-            meal_number=meal.meal_number,
+            meal_name=meal.meal_name,
+            time_taken=meal.time_taken,
             items=items_out
         ))
     return result
 
 
+#음식 삭제 API 추가 (MealItem 단위 삭제)
+@router.delete("/delete_meal_item", response_model=dict)
+def delete_meal_item(
+    meal_item_id: int,
+    user_id: str,
+    session: Session = Depends(get_db)
+):
+    meal_item = session.query(db.MealItem).get(meal_item_id)
+    if not meal_item:
+        raise HTTPException(status_code=404, detail="Meal item not found")
+
+    meal = session.query(db.MealLog).get(meal_item.meal_id)
+    if not meal or meal.user_id != user_id:
+        raise HTTPException(status_code=403, detail="Not allowed")
+
+    session.delete(meal_item)
+    session.commit()
+
+    return {"status": "success", "deleted_meal_item_id": meal_item_id}
+
+#음식 수정 API 
+@router.put("/update_meal_item", response_model=dict)
+def update_meal_item(
+    meal_item_id: int,
+    user_id: str,
+    quantity_g: float | None = Form(None),
+    servings: float | None = Form(None),
+    session: Session = Depends(get_db)
+):
+    meal_item = session.query(db.MealItem).get(meal_item_id)
+    if not meal_item:
+        raise HTTPException(status_code=404, detail="Meal item not found")
+
+    meal = session.query(db.MealLog).get(meal_item.meal_id)
+    if not meal or meal.user_id != user_id:
+        raise HTTPException(status_code=403, detail="Not allowed")
+
+    food = session.query(db.Food).get(meal_item.food_id)
+    base_weight = food.weight or 100.0
+
+    # 둘 다 들어오면 오류
+    if quantity_g and servings:
+        raise HTTPException(status_code=400, detail="Provide only one of quantity_g or servings")
+
+    # g 수정
+    if quantity_g:
+        meal_item.quantity_g = quantity_g
+
+    # 인분 수정
+    elif servings:
+        meal_item.quantity_g = servings * base_weight
+
+    else:
+        raise HTTPException(status_code=400, detail="No update value provided")
+
+    session.commit()
+
+    # 누적 요약 재계산
+    recompute_daily_summaries(user_id, meal.date, session)
+
+    return {
+        "status": "updated",
+        "meal_item_id": meal_item.id,
+        "new_quantity_g": meal_item.quantity_g
+    }
+
+
+#끼니 삭제 기능 (Meal 자체 삭제)
+@router.delete("/delete_meal", response_model=dict)
+def delete_meal(
+    meal_id: int,
+    user_id: str,
+    session: Session = Depends(get_db)
+):
+    meal = session.query(db.MealLog).get(meal_id)
+    if not meal:
+        raise HTTPException(status_code=404, detail="Meal not found")
+
+    if meal.user_id != user_id:
+        raise HTTPException(status_code=403, detail="Not allowed")
+
+    session.delete(meal)
+    session.commit()
+
+    return {"status": "deleted", "meal_id": meal_id}
