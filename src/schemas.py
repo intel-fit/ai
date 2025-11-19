@@ -74,8 +74,8 @@ class UserBase(BaseModel):
     sex: str
     height: float
     weight: float
-    body_fat: float | None = None
-    skeletal_muscle: float | None = None
+    body_fat: Optional[float] = None    # ⬅️ Optional 처리
+    skeletal_muscle: Optional[float] = None   # ⬅️ Optional 처리
     activity_level: float = 1.2
     goal: str = "maintenance"
 
