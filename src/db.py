@@ -80,7 +80,8 @@ class MealLog(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(String, ForeignKey("users.id"), nullable=False)
     date = Column(Date, nullable=False)
-    meal_number = Column(Integer, nullable=False)  # 1,2,3,4번째 끼니
+    meal_name = Column(String, nullable=False)   # 예: 아침 / 점심 / 저녁 / 간식
+    time_taken = Column(String, nullable=True)   # 예: "09:30"
 
     user = relationship("User", back_populates="meal_logs")
     items = relationship("MealItem", back_populates="meal", cascade="all, delete-orphan")

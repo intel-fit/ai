@@ -59,6 +59,7 @@ def init_test_user(session: Session = Depends(get_db)):
     # --------------------------
     # 3️⃣ 식단 로그 (단순 샘플 3끼 × 7일)
     # --------------------------
+    sample_meal_names = ["아침", "점심", "저녁"]
     sample_foods = [
         {"name": "닭가슴살", "calories": 165, "protein": 31, "fat": 3.6, "carbs": 0, "weight": 100},
         {"name": "현미밥", "calories": 150, "protein": 3, "fat": 1, "carbs": 32, "weight": 100},
@@ -85,13 +86,22 @@ def init_test_user(session: Session = Depends(get_db)):
 
     foods = {f.name: f for f in session.query(db.Food).all()}
 
+
     # 7일치 식단 생성 (매일 3끼)
     for i in range(7):
         log_date = today - timedelta(days=i)
-        for meal_no in range(1, 4):
-            meal = db.MealLog(user_id=user_id, date=log_date, meal_number=meal_no)
+
+        for idx, meal_name in enumerate(sample_meal_names):
+            meal = db.MealLog(
+                user_id=user_id,
+                date=log_date,
+                meal_name=meal_name,  # ✔ 문자열 기반 끼니명
+                time_taken=f"{8+idx}:00"  # 아침 08:00 / 점심 09:00 / 저녁 10:00 예시
+            )
             session.add(meal)
             session.commit()
+
+            # 음식 3개씩 넣기
             for fname in ["닭가슴살", "현미밥", "샐러드"]:
                 f = foods[fname]
                 item = db.MealItem(
@@ -100,11 +110,10 @@ def init_test_user(session: Session = Depends(get_db)):
                     quantity_g=100,
                 )
                 session.add(item)
+
             session.commit()
 
-        # ✅ 하루 데이터 요약 자동 계산
+        # 🟩 하루 요약 재계산
         recompute_daily_summaries(user_id, log_date, session)
-
-    session.commit()
 
     return {"msg": "테스트 유저, 7일 운동 + 식단 + 요약 생성 완료 ✅"}

@@ -116,26 +116,36 @@ class MealItemBase(BaseModel):
 class MealItemCreate(MealItemBase):
     pass
 
-class MealItemOut(MealItemBase):
-    id: int
-    food: FoodOut
+class MealItemOut(BaseModel):
+    meal_item_id: int
+    food_id: int
+    food_name: str
+    quantity_g: float
+    calories: float
+    carbs: float
+    protein: float
+    fat: float
 
     class Config:
         from_attributes = True
 
 class MealLogBase(BaseModel):
     date: date
+    meal_name: str
+    time_taken: Optional[str] = None
 
 class MealLogCreate(MealLogBase):
     pass
 
-class MealLogOut(MealLogBase):
-    id: int
-    meal_number: int
-    items: List[MealItemOut] = []
+class MealLogOut(BaseModel):
+    meal_id: int
+    meal_name: str
+    time_taken: Optional[str]
+    items: List[MealItemOut]
 
     class Config:
         from_attributes = True
+
 
 class ExerciseFeedbackCreate(BaseModel):
     user_id: str
