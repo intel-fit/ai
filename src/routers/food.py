@@ -837,3 +837,45 @@ def delete_meal(
     session.commit()
 
     return {"status": "deleted", "meal_id": meal_id}
+
+
+@router.get("/daily_goal", response_model=dict)
+def get_daily_goal(user_id: str, session: Session = Depends(get_db)):
+
+    user = session.query(db.User).get(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # 1. BMR 계산 (Mifflin–St Jeor)
+    if user.sex.lower() == "male":
+        bmr = 10 * user.weight + 6.25 * user.height - 5 * user.age + 5
+    else:
+        bmr = 10 * user.weight + 6.25 * user.height - 5 * user.age - 161
+
+    # 2. TDEE
+    tdee = bmr * user.activity_level
+
+    # 3. 목표 칼로리
+    if user.goal == "fat_loss":
+        goal_kcal = tdee * 0.8
+        ratio = {"protein": 0.30, "carbs": 0.40, "fat": 0.30}
+    elif user.goal == "hypertrophy":
+        goal_kcal = tdee * 1.1
+        ratio = {"protein": 0.25, "carbs": 0.50, "fat": 0.25}
+    else:  # maintenance
+        goal_kcal = tdee
+        ratio = {"protein": 0.25, "carbs": 0.45, "fat": 0.30}
+
+    # 4. 탄단지 그램 계산 (1g: P4 / C4 / F9 kcal)
+    protein_g = (goal_kcal * ratio["protein"]) / 4
+    carbs_g = (goal_kcal * ratio["carbs"]) / 4
+    fat_g = (goal_kcal * ratio["fat"]) / 9
+
+    return {
+        "tdee": round(tdee, 1),
+        "goal_kcal": round(goal_kcal, 1),
+        "protein_g": round(protein_g, 1),
+        "carbs_g": round(carbs_g, 1),
+        "fat_g": round(fat_g, 1),
+        "ratio": ratio
+    }
