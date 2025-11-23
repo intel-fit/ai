@@ -1,9 +1,11 @@
 # ==========================================
-# src/services/exercise_planner.py  (v2.3 time-aware)
+# src/services/exercise_planner.py  (v2.4 time-aware + feedback-aware)
 # ==========================================
 import os, random
+import math
 from typing import List, Dict, Tuple, Set, Optional
 from sqlalchemy import text, create_engine
+from sqlalchemy.orm import Session
 from src.schemas import UserExerciseContext
 from src.utils.muscle_maps import (
     MUSCLE_KEYWORDS, GOAL_PARAMS, SPLIT_TEMPLATES,
@@ -16,7 +18,13 @@ from src.utils.load_rules import suggest_start_load, suggest_tempo, suggest_rir
 from src.utils.warmup_generator import generate_warmup_sets
 from src.utils.progression_engine import apply_progression
 from src.services.ml_progression_model import predict_next_weight
+from src.services.exercise_feedback_service import get_user_feedback_profile
+import pickle
 
+
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "exercise_model.pkl")
+with open(MODEL_PATH, "rb") as f:
+    ML_MODEL = pickle.load(f)
 
 
 # ✅ 운동 DB 연결
@@ -75,6 +83,7 @@ FOCUS_EXCLUDE = {
     # Legs는 제외 규칙 없음
 }
 
+
 def _belongs_to_groups(item: dict, groups: set[str]) -> bool:
     txt = f"{item.get('targetMuscles','')} {item.get('bodyParts','')}"
     for g in groups:
@@ -82,15 +91,15 @@ def _belongs_to_groups(item: dict, groups: set[str]) -> bool:
             return True
     return False
 
+
 def _conflicts_groups(item: dict, groups: set[str]) -> bool:
     return _belongs_to_groups(item, groups)
 
+
 # 그룹키 -> 후보 매칭에 사용할 키워드 집합(이미 MUSCLE_KEYWORDS에 정의되어 있음)
-# 필요 시 여기에 alias를 달아 확장 가능
 def _has_group_match(item_text: str, group_key: str) -> bool:
     kws = MUSCLE_KEYWORDS.get(group_key, [])
     return any(kw in item_text for kw in kws)
-
 
 
 # ---------------------------
@@ -110,8 +119,11 @@ def age_profile(age: Optional[int]) -> Dict:
 # ===========================
 # 메인 진입점
 # ===========================
-def generate_week_plan(ctx: UserExerciseContext):
+def generate_week_plan(ctx: UserExerciseContext, session: Session):
     equips = ctx.available_equipment or (DEFAULT_HOME_EQUIPS if ctx.environment == "home" else None)
+
+    # 🔥 유저 피드백 정보 로딩
+    feedback_profile = get_user_feedback_profile(ctx.user_id, session)
 
     split = determine_split(ctx)
     priority = compute_muscle_priority(ctx)
@@ -125,25 +137,35 @@ def generate_week_plan(ctx: UserExerciseContext):
             continue
 
         if focus == "Lower":
-            session = build_lower_session(ctx, used_ids)
-            plan.append({"day": day, "focus": focus, "exercises": session})
+            lower_session = build_lower_session(ctx, used_ids)
+            plan.append({"day": day, "focus": focus, "exercises": lower_session})
             continue
 
         target_groups = FOCUS_TO_GROUPS.get(focus, [])
         candidates = fetch_candidates(target_groups, equips, ctx.health_conditions, ctx)
 
-        chosen = pick_exercises(candidates, priority, target_groups, k=5, used_ids=used_ids, focus=focus)
+        chosen = pick_exercises(
+            candidates,
+            priority,
+            target_groups,
+            k=5,
+            used_ids=used_ids,
+            focus=focus,
+            feedback_profile=feedback_profile
+        )
         used_ids.update(e["exerciseId"] for e in chosen)
 
-        session = attach_sets_reps(chosen, ctx)
-        plan.append({"day": day, "focus": focus, "exercises": session})
+        session_exs = attach_sets_reps(chosen, ctx)
+        plan.append({"day": day, "focus": focus, "exercises": session_exs})
+
         # 목표 시간이 있는 경우, 세션 시간이 너무 짧으면 운동을 추가
         if ctx.target_time_min:
             MIN_RATIO = 0.75   # 예: 목표의 75%는 최소 보장
+
             def est_session_min(exs):
                 return sum(estimate_exercise_seconds(ex) for ex in exs) / 60.0
 
-            cur_min = est_session_min(session)
+            cur_min = est_session_min(session_exs)
 
             if cur_min < ctx.target_time_min * MIN_RATIO:
                 # 후보 중 남은 운동 가져오기
@@ -166,19 +188,17 @@ def generate_week_plan(ctx: UserExerciseContext):
                 # 최대 2개 추가
                 for _, extra in extras[:2]:
                     used_ids.add(extra["exerciseId"])
-                    session.append(attach_sets_reps([extra], ctx)[0])
-                    cur_min = est_session_min(session)
+                    session_exs.append(attach_sets_reps([extra], ctx)[0])
+                    cur_min = est_session_min(session_exs)
                     if cur_min >= ctx.target_time_min * MIN_RATIO:
                         break
 
             # 보정된 세션을 다시 저장
-            plan[-1]["exercises"] = session
+            plan[-1]["exercises"] = session_exs
 
-
-    # 👉 시간 맞춤 보정: 목표 시간이 전달되면 세션별 총 시간을 ±10% 이내로 자동 튜닝
+    # 👉 시간 맞춤 보정: 목표 시간이 전달되면 세션별 총 시간을 ±3% 이내로 자동 튜닝
     if getattr(ctx, "target_time_min", None):
         plan = adjust_to_target_time(plan, ctx)
-
 
     summary = summarize_plan(ctx, priority, split)
 
@@ -313,9 +333,28 @@ def fetch_candidates(groups, equips, conditions, ctx):
         out.append(item)
     return out
 
+# ================================================
+# 머신러닝 기반 운동 점수 예측 함수 (임시/가상 모델)
+# ================================================
+def predict_exercise_ml_score(user_features: dict, exercise: dict) -> float:
+    # ML 입력 벡터 구성 (원하는 feature 선택 가능)
+    features = {
+        "avg_intensity": user_features.get("avg_intensity", 0),
+        "goal_code": 1 if user_features.get("goal") == "bulk" else 0,
+        "equip_match": 1 if exercise.get("equipments", "").lower()
+                          in user_features.get("preferred_equips", []) else 0,
+        "category_match": 1 if exercise.get("category", "").lower()
+                          in user_features.get("preferred_categories", []) else 0,
+    }
+
+    X = np.array([list(features.values())], dtype=float)
+
+    pred = ML_MODEL.predict(X)[0]  # 0~1 사이 값 권장
+    return max(0.05, min(1.0, float(pred)))
+
 
 # ===========================
-# 샘플링 (부위 우선 + 다양성 + Lower 보장)
+# 샘플링 (부위 우선 + 다양성 + Lower 보장 + 피드백 반영)
 # ===========================
 def pick_exercises(
     candidates: List[dict],
@@ -323,122 +362,203 @@ def pick_exercises(
     groups: List[str],
     k: int = 5,
     used_ids: Set[str] | None = None,
-    focus: str = ""
+    focus: str = "",
+    feedback_profile: Optional[dict] = None
 ) -> List[dict]:
-    """
-    1) FOCUS_QUOTAS를 기준으로 각 그룹 최소 개수 채움
-    2) 남는 슬롯은 기존 가중치(부위 우선순위 + prefer 키워드)대로 채움
-    3) 동일 타깃/장비 과다 중복 방지
-    4) Lower의 다리/둔근 보장 로직은 그대로 유지
-    """
+
     used_ids = used_ids or set()
     focus_quotas = FOCUS_QUOTAS.get(focus, [])
 
-    # 후보에 가중치 부여
+    # ---------------------------
+    # 1) 피드백 기반 가중치 계산 함수
+    # ---------------------------
+    def apply_feedback_weight(base_weight: float, c: dict) -> float:
+        if not feedback_profile:
+            return base_weight
+
+        w = base_weight
+        ex_id = c["exerciseId"]
+        cat = (c.get("category") or "").lower()
+
+        # 1️⃣ 개별 운동 선호/비선호
+        if ex_id in feedback_profile.get("like_exercises", set()):
+            w *= 1.30
+        elif ex_id in feedback_profile.get("dislike_exercises", set()):
+            w *= 0.60
+
+        # 2️⃣ 부위(group) 선호/비선호
+        for g in groups:
+            if g in feedback_profile.get("like_groups", set()):
+                w *= 1.20
+            if g in feedback_profile.get("dislike_groups", set()):
+                w *= 0.70
+
+        # 3️⃣ 장비/카테고리 선호/비선호
+        if cat in feedback_profile.get("like_equip", set()):
+            w *= 1.15
+        if cat in feedback_profile.get("dislike_equip", set()):
+            w *= 0.80
+
+        return w
+
+    # ---------------------------
+    # 2) 기본 + 피드백 가중치 계산
+    # ---------------------------
     weighted: List[Tuple[float, dict]] = []
     for c in candidates:
         if c["exerciseId"] in used_ids:
             continue
+
         txt = f"{c.get('targetMuscles','')} {c.get('bodyParts','')}"
-        w = 0.0
+        base_w = 0.0
+
+        # 부위 우선순위 반영
         for g in groups:
             if any(kw in txt for kw in MUSCLE_KEYWORDS.get(g, [])):
-                w += priority.get(g, 1.0)
-        w += c.get("_pref", 0)
-        if w > 0:
-            weighted.append((w, c))
+                base_w += priority.get(g, 1.0)
+
+        # prefer 키워드 (_pref)
+        base_w += c.get("_pref", 0)
+
+        # 🔥 피드백 기반 가중치 반영
+        final_w = apply_feedback_weight(base_w, c)
+                # -----------------------------------------
+        # 🔥 ML 점수 기반 가중치 추가
+        # -----------------------------------------
+        if feedback_profile and "ml_features" in feedback_profile:
+            ml_score = predict_exercise_ml_score(
+                feedback_profile["ml_features"],
+                c
+            )
+            # ML 점수는 가중치에 곱해주는 방식 (하이브리드)
+            final_w *= (1.0 + ml_score)
+
+
+        if final_w > 0:
+            weighted.append((final_w, c))
+
     weighted.sort(key=lambda x: x[0], reverse=True)
+
+    # ---------------------------
+    # 3) Include / Exclude 필터
+    # ---------------------------
     include = set(FOCUS_INCLUDE.get(focus, []))
     exclude = set(FOCUS_EXCLUDE.get(focus, []))
 
     if include:
-        weighted = [(w, c) for (w, c) in weighted if _belongs_to_groups(c, include)]
-    if exclude:
-        weighted = [(w, c) for (w, c) in weighted if not _conflicts_groups(c, exclude)]
+        weighted = [(w, c) for w, c in weighted if _belongs_to_groups(c, include)]
 
+    if exclude:
+        weighted = [(w, c) for w, c in weighted if not _conflicts_groups(c, exclude)]
+
+    # ---------------------------
+    # 4) 선택 로직
+    # ---------------------------
     chosen: List[dict] = []
     seen_targets: Set[str] = set()
     seen_equips: Set[str] = set()
 
-    # ---- 1) 쿼터 우선 채우기
     def _eligible(c: dict) -> bool:
-        # 기본 중복 억제
-        if c["exerciseId"] in {x["exerciseId"] for x in chosen}: 
+        if c["exerciseId"] in {x["exerciseId"] for x in chosen}:
             return False
         t = (c.get("targetMuscles") or "").strip()
         e = (c.get("equipments") or "").strip()
+
+        # 부위 중복 억제
         if any(t and (t in s or s in t) for s in seen_targets):
             return False
+
+        # 장비 중복 억제
         if e and e in seen_equips:
             return False
+
         return True
 
+    # ---- A) 쿼터 우선 채우기
     for group_key, need in focus_quotas:
-        if len(chosen) >= k: 
+        if len(chosen) >= k:
             break
-        # 해당 그룹에 매칭되는 후보만 추림(가중치 순)
-        group_pool = []
-        for w, c in weighted:
-            txt = f"{c.get('targetMuscles','')} {c.get('bodyParts','')}"
-            if _has_group_match(txt, group_key):
-                group_pool.append((w, c))
+
+        group_pool = [
+            (w, c) for w, c in weighted
+            if _has_group_match(f"{c.get('targetMuscles','')} {c.get('bodyParts','')}", group_key)
+        ]
 
         for _, c in group_pool:
-            if len([x for x in chosen if _has_group_match(f"{x.get('target','')} {x.get('equip','')}", group_key)]) >= need:
-                break  # 이미 해당 그룹 쿼터 충족
+            if len([x for x in chosen if _has_group_match(
+                    f"{x.get('targetMuscles','')} {x.get('bodyParts','')}", group_key)]) >= need:
+                break
+
             if not _eligible(c):
                 continue
+
             chosen.append(c)
-            t = (c.get("targetMuscles") or "").strip()
-            e = (c.get("equipments") or "").strip()
-            if t: seen_targets.add(t)
+            seen_targets.add(c.get("targetMuscles", "").strip())
+            e = c.get("equipments", "")
             if e: seen_equips.add(e)
+
             if len(chosen) >= k:
                 break
 
-    # ---- 2) 남는 슬롯을 전체 가중치 상위로 보충
-    if len(chosen) < k:
-        for _, c in weighted:
-            if len(chosen) >= k:
-                break
-            if not _eligible(c):
-                continue
-            chosen.append(c)
-            t = (c.get("targetMuscles") or "").strip()
-            e = (c.get("equipments") or "").strip()
-            if t: seen_targets.add(t)
-            if e: seen_equips.add(e)
+    # ---- B) 남는 슬롯 보충
+    for _, c in weighted:
+        if len(chosen) >= k:
+            break
+        if not _eligible(c):
+            continue
 
-    # ---- 3) Lower 보정(다리·둔근 최소 보장 + 코어 과다 제한) 기존 로직 유지
+        chosen.append(c)
+        seen_targets.add(c.get("targetMuscles", "").strip())
+        e = c.get("equipments", "")
+        if e: seen_equips.add(e)
+
+    # ---- C) Lower 보정
     if focus == "Lower":
         leg_kws = set(MUSCLE_KEYWORDS.get("legs", []) + MUSCLE_KEYWORDS.get("glutes", []))
+
         def is_leglike(item: dict) -> bool:
             txt = f"{item.get('targetMuscles','')} {item.get('bodyParts','')}"
             return any(kw in txt for kw in leg_kws)
 
         leg_count = sum(1 for it in chosen if is_leglike(it))
+
+        # 다리 부족 → 다리 운동 추가
         if leg_count < 2:
             extras = [c for _, c in weighted if is_leglike(c) and c not in chosen]
-            random.shuffle(extras)
             for ex in extras[: (2 - leg_count)]:
-                if ex.get("equipments") in seen_equips:
-                    continue
                 chosen.append(ex)
-                seen_equips.add(ex.get("equipments",""))
 
+        # 코어 과다 방지
         core_kws = set(MUSCLE_KEYWORDS.get("core", []))
-        core_items = [it for it in chosen if any(kw in f"{it.get('targetMuscles','')} {it.get('bodyParts','')}" for kw in core_kws)]
+        core_items = [it for it in chosen if any(
+            kw in f"{it.get('targetMuscles','')} {it.get('bodyParts','')}"
+            for kw in core_kws
+        )]
+
         if len(core_items) > 2:
             surplus = core_items[2:]
             for s in surplus:
-                if s in chosen:
-                    chosen.remove(s)
-            replacements = [c for _, c in weighted if is_leglike(c) and c not in chosen]
-            for r in replacements[: len(surplus)]:
-                chosen.append(r)
+                chosen.remove(s)
 
     random.shuffle(chosen)
+    # 디버그용 출력
+    debug_exercise_weights(weighted, chosen)
+
     return chosen[:k]
+
+
+# ===========================
+# DEBUG: 추천 가중치/선택 과정 분석
+# ===========================
+def debug_exercise_weights(weighted_list, chosen):
+    print("\n===== 🔍 EXERCISE WEIGHT DEBUG =====")
+    for w, c in weighted_list[:15]:  # 상위 15개까지만
+        print(f"[{c['exerciseId']}] {c['name']} | w={round(w,3)} | "
+              f"target={c.get('targetMuscles')} | equip={c.get('equipments')}")
+    print("----- 선택된 운동 -----")
+    for c in chosen:
+        print(f"✔ {c['exerciseId']} {c['name']}")
+    print("====================================\n")
 
 
 # ===========================
@@ -463,7 +583,6 @@ def attach_sets_reps(ex_list: List[dict], ctx: UserExerciseContext) -> List[dict
         p["intensity"] = "low-moderate"
         p["reps"] = (max(10, p["reps"][0]), max(15, p["reps"][1]))
 
-    
     compound_found = False
     
     def pick_range(r: Tuple[int,int]) -> int:
@@ -478,6 +597,7 @@ def attach_sets_reps(ex_list: List[dict], ctx: UserExerciseContext) -> List[dict
         sets = max(1, min(6, sets))
         reps = max(6, min(20, reps))
         rest = max(20, min(150, rest))
+
         # ✅ 새로 추가: 시작무게 / 템포 / RIR
         start_load = suggest_start_load(
             exercise=e,
@@ -505,6 +625,7 @@ def attach_sets_reps(ex_list: List[dict], ctx: UserExerciseContext) -> List[dict
 
         tempo = suggest_tempo(ctx.goal)
         rir = suggest_rir(ctx.goal, ctx.experience)
+
         # ✅ 첫 복합운동이면 워밍업 생성
         warmups = []
         if not compound_found and (e.get("category") or "").lower() == "compound":
@@ -517,6 +638,7 @@ def attach_sets_reps(ex_list: List[dict], ctx: UserExerciseContext) -> List[dict
             intensity = "moderate-high"
         else:
             intensity = "high"
+
         out.append({
             "exerciseId": e["exerciseId"],
             "name": e["name"],
@@ -527,7 +649,6 @@ def attach_sets_reps(ex_list: List[dict], ctx: UserExerciseContext) -> List[dict
             "reps": reps,
             "rest_sec": rest,
             "intensity": intensity,
-    
             # 🔹 AI 예측 포함
             "rule_weight": start_load,
             "ml_pred": predicted_weight,
@@ -536,7 +657,6 @@ def attach_sets_reps(ex_list: List[dict], ctx: UserExerciseContext) -> List[dict
             "tempo": tempo,
             "warmups": warmups,
             "note": "AI-weight hybrid applied"
-
         })
     return out
 
@@ -649,8 +769,6 @@ def adjust_to_target_time(plan: List[dict], ctx) -> List[dict]:
     return new_plan
 
 
-
-
 # ===========================
 # 간단 메트릭 추정 (시간/칼로리)
 # ===========================
@@ -744,6 +862,3 @@ def _resolve_day_target(ctx, day_index: int) -> Optional[float]:
         v = t.get(day_index)
         return float(v) if v and v > 0 else None
     return None
-
-
-

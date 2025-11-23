@@ -1,24 +1,29 @@
-# src/db.py
+# src/db.py (FINAL VERSION)
 import os
-from sqlalchemy import create_engine, Column, Integer, String, Float, Date, ForeignKey, UniqueConstraint, inspect
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Float, Date, ForeignKey,
+    UniqueConstraint, inspect, DateTime, Text, Boolean, JSON
+)
+from datetime import datetime, date
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
+import uuid
 
 
-
-# DB 경로
+# ----------------------
+# DB PATH 설정
+# ----------------------
 DB_DIR = os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(DB_DIR, exist_ok=True)
 DB_PATH = os.path.join(DB_DIR, "food_db.sqlite")
 DATABASE_URL = f"sqlite:///{DB_PATH}"
 
-# SQLAlchemy 세팅
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 # ----------------------
-# Food 모델
+# Food
 # ----------------------
 class Food(Base):
     __tablename__ = "foods"
@@ -38,7 +43,7 @@ class Food(Base):
     __table_args__ = (UniqueConstraint('name', 'company', name='_name_company_uc'),)
 
 # ----------------------
-# User 모델
+# User
 # ----------------------
 class User(Base):
     __tablename__ = "users"
@@ -52,43 +57,42 @@ class User(Base):
     skeletal_muscle = Column(Float, nullable=True)
     activity_level = Column(Float, default=1.2)
     goal = Column(String, default="maintenance")
-    
+
     exercise_logs = relationship("ExerciseLog", back_populates="user")
     meal_logs = relationship("MealLog", back_populates="user", cascade="all, delete-orphan")
 
 # ----------------------
-# ExerciseLog 모델
+# ExerciseLog (daily)
 # ----------------------
 class ExerciseLog(Base):
     __tablename__ = "exercise_logs"
-    
+
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(String, ForeignKey("users.id"))
     date = Column(Date, nullable=False)
     duration_min = Column(Float, nullable=False)
     calories_burned = Column(Float, nullable=False)
     intensity = Column(Float, nullable=True)
-    
+
     user = relationship("User", back_populates="exercise_logs")
 
 # ----------------------
-# 끼니 단위 MealLog
+# MealLog
 # ----------------------
 class MealLog(Base):
     __tablename__ = "meal_logs"
-    
+
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(String, ForeignKey("users.id"), nullable=False)
     date = Column(Date, nullable=False)
-    meal_name = Column(String, nullable=False)   # 예: 아침 / 점심 / 저녁 / 간식
-    time_taken = Column(String, nullable=True)   # 예: "09:30"
+    meal_name = Column(String, nullable=False)
+    time_taken = Column(String, nullable=True)
 
     user = relationship("User", back_populates="meal_logs")
     items = relationship("MealItem", back_populates="meal", cascade="all, delete-orphan")
 
-
 # ----------------------
-# MealItem (각 끼니 안의 음식 단위)
+# MealItem
 # ----------------------
 class MealItem(Base):
     __tablename__ = "meal_items"
@@ -96,14 +100,14 @@ class MealItem(Base):
     id = Column(Integer, primary_key=True, index=True)
     meal_id = Column(Integer, ForeignKey("meal_logs.id"), nullable=False)
     food_id = Column(Integer, ForeignKey("foods.id"), nullable=False)
-    quantity_g = Column(Float, default=100.0)  # 섭취 중량(g)
+    quantity_g = Column(Float, default=100.0)
 
     meal = relationship("MealLog", back_populates="items")
     food = relationship("Food")
 
-
-
-# 바디컴프(인바디) 로그
+# ----------------------
+# Body Composition Log
+# ----------------------
 class BodyCompLog(Base):
     __tablename__ = "body_comp_logs"
     id = Column(Integer, primary_key=True)
@@ -111,10 +115,12 @@ class BodyCompLog(Base):
     date = Column(Date, nullable=False, index=True)
     weight_kg = Column(Float, nullable=True)
     body_fat_pct = Column(Float, nullable=True)
-    smm_kg = Column(Float, nullable=True)  # skeletal muscle mass
+    smm_kg = Column(Float, nullable=True)
     note = Column(String, default="")
 
-# 일일 식단 요약(섭취)
+# ----------------------
+# Daily Nutrition Summary
+# ----------------------
 class DailyNutritionSummary(Base):
     __tablename__ = "daily_nutrition_summary"
     id = Column(Integer, primary_key=True)
@@ -127,10 +133,12 @@ class DailyNutritionSummary(Base):
     fiber_g = Column(Float, default=0)
     sugar_g = Column(Float, default=0)
     sodium_mg = Column(Float, default=0)
-    processed_ratio = Column(Float, default=0)  # 초가공 비중(0~1)
-    distinct_main_sources = Column(Integer, default=0)  # 탄수 소스 다양성
+    processed_ratio = Column(Float, default=0)
+    distinct_main_sources = Column(Integer, default=0)
 
-# 일일 운동 요약(소모)
+# ----------------------
+# Daily Exercise Summary
+# ----------------------
 class DailyExerciseSummary(Base):
     __tablename__ = "daily_exercise_summary"
     id = Column(Integer, primary_key=True)
@@ -140,18 +148,19 @@ class DailyExerciseSummary(Base):
     calories_burned = Column(Float, default=0)
     avg_intensity = Column(Float, default=0)
 
-# 코치 노트(요약 피드백)
+# ----------------------
+# Coach Notes
+# ----------------------
 class CoachNote(Base):
     __tablename__ = "coach_notes"
     id = Column(Integer, primary_key=True)
     user_id = Column(String, ForeignKey("users.id"), index=True, nullable=False)
-    period = Column(String, nullable=False)  # 'daily:YYYY-MM-DD', 'weekly:YYYY-WW'
-    summary = Column(String)                 # 자연어 요약
-    action_items = Column(String)            # 할 일/권고 리스트(문자열 JSON)
-
+    period = Column(String, nullable=False)
+    summary = Column(String)
+    action_items = Column(String)
 
 # ----------------------
-# Daily Health Score (AI 평가 점수)
+# DailyHealthScore
 # ----------------------
 class DailyHealthScore(Base):
     __tablename__ = "daily_health_scores"
@@ -164,51 +173,77 @@ class DailyHealthScore(Base):
     total_score = Column(Float, default=0.0)
 
 # ----------------------
-# 운동 추천 기록 (AI 루틴)
+# UserExerciseRec (AI 루틴 기록)
 # ----------------------
-from sqlalchemy import Boolean, JSON
-
 class UserExerciseRec(Base):
     __tablename__ = "user_exercise_recs"
-    id = Column(String, primary_key=True, index=True)  # UUID
+
+    id = Column(String, primary_key=True, index=True)
     user_id = Column(String, ForeignKey("users.id"), index=True)
     date = Column(Date, nullable=False)
     day = Column(Integer, nullable=False)
     focus = Column(String, nullable=False)
-    exercises_json = Column(JSON, nullable=False)  # 추천된 운동 리스트 (dict 배열)
-    feedback_score = Column(Float, nullable=True)  # 1~5점
-    completed = Column(Boolean, default=False)     # 수행 여부
+    exercises_json = Column(JSON, nullable=False)
+    feedback_score = Column(Float, nullable=True)
+    completed = Column(Boolean, default=False)
     created_at = Column(Date, nullable=False)
 
+# ==================================================
+# NEW — Exercise Session + Items (User performed logs)
+# ==================================================
+class ExerciseSession(Base):
+    __tablename__ = "exercise_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    date = Column(Date, default=date.today)
+    session_name = Column(String)
+    duration_min = Column(Float)
+    intensity_score = Column(Float)
+    feedback = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class ExerciseSessionItem(Base):
+    __tablename__ = "exercise_session_items"
+
+
+    id = Column(String, primary_key=True, index=True, default=lambda: str(uuid.uuid4()))
+    session_id = Column(String, ForeignKey("exercise_sessions.id"), nullable=False)
+
+    exercise_id = Column(String, nullable=False)
+    exercise_name = Column(String, nullable=False)
+
+    weight_kg = Column(Float, nullable=True)
+    reps = Column(Integer, nullable=True)
+    sets = Column(Integer, nullable=True)
+    warmup_json = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 # ----------------------
-# DB 초기화
+# init_db()
 # ----------------------
 def init_db():
     inspector = inspect(engine)
 
-    # Food 테이블 확인
-    if not inspector.has_table("foods"):
-        Food.__table__.create(bind=engine)
-
-    # ----------------------
-    # 삭제 후 재생성할 테이블 리스트
-    # ----------------------
-    tables_to_reset = [User, ExerciseLog, MealLog, MealItem]
-
-    for table in tables_to_reset:
-        if inspector.has_table(table.__tablename__):
-            table.__table__.drop(bind=engine)
-        table.__table__.create(bind=engine)
-
-    # ✅ 신규 요약/인바디/노트 테이블은 드랍하지 않고 없으면 생성
-    for table in [BodyCompLog, DailyNutritionSummary, DailyExerciseSummary, CoachNote]:
+    # 필수 테이블 존재 확인 및 생성
+    base_tables = [Food, User, ExerciseLog, MealLog, MealItem]
+    for table in base_tables:
         if not inspector.has_table(table.__tablename__):
             table.__table__.create(bind=engine)
 
+    # 요약/코치/헬스스코어
     for table in [BodyCompLog, DailyNutritionSummary, DailyExerciseSummary, CoachNote, DailyHealthScore]:
         if not inspector.has_table(table.__tablename__):
             table.__table__.create(bind=engine)
-    
+
+    # AI 추천
     if not inspector.has_table("user_exercise_recs"):
         UserExerciseRec.__table__.create(bind=engine)
 
+    # NEW — Exercise Sessions
+    if not inspector.has_table("exercise_sessions"):
+        ExerciseSession.__table__.create(bind=engine)
+
+    if not inspector.has_table("exercise_session_items"):
+        ExerciseSessionItem.__table__.create(bind=engine)

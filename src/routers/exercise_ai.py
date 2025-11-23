@@ -8,4 +8,4 @@ router = APIRouter(tags=["AI Exercise Planner"])
 @router.post("/ai/exercise_plan")
 def ai_exercise_plan(ctx: UserExerciseContext):
     """AI 기반 사용자 맞춤 운동 루틴 추천"""
-    return generate_week_plan(ctx)
+    return generate_week_plan(ctx, session)

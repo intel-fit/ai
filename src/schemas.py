@@ -1,7 +1,7 @@
 from typing import Optional
 from pydantic import BaseModel, field_validator
 from datetime import date
-
+from typing import Optional
 
 
 # ----------------------
@@ -158,3 +158,37 @@ class ExerciseFeedbackCreate(BaseModel):
 class ExerciseFeedbackUpdate(BaseModel):
     feedback_score: float | None = None  # 1~5점
     completed: bool | None = None
+
+class ExerciseFeedbackIn(BaseModel):
+    user_id: str
+    exercise_id: str
+    exercise_name: str
+    category: Optional[str] = None
+    target_group: Optional[str] = None
+
+    sets: Optional[int] = None
+    reps: Optional[int] = None
+    duration_sec: Optional[int] = None
+
+    feedback: str    # "like" or "dislike"
+
+class ExerciseFeedbackOut(BaseModel):
+    status: str
+
+class ExerciseSessionItemInput(BaseModel):
+    exercise_id: str          # 운동 고유 ID
+    name: str                 # 운동 이름
+    weight: float
+    reps: int
+    sets: int
+    warmup: Optional[list] = None
+
+
+class ExerciseSessionInput(BaseModel):
+    user_id: str
+    session_name: str
+    duration_min: float
+    intensity: int                   # 1~5 점
+    feedback: str                    # "like" | "dislike"
+    items: List[ExerciseSessionItemInput]
+

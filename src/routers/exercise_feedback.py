@@ -1,14 +1,11 @@
-# ============================================
-# src/routers/exercise_feedback.py
-# ============================================
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from datetime import date
-from uuid import uuid4
 from src import db
-from src.schemas import ExerciseFeedbackCreate, ExerciseFeedbackUpdate
+from src.schemas import ExerciseSessionInput
+import json
+import uuid
+router = APIRouter(tags=["Exercise Feedback"])
 
-router = APIRouter(prefix="/exercise_feedback", tags=["Exercise Feedback"])
 
 def get_db():
     session = db.SessionLocal()
@@ -18,38 +15,44 @@ def get_db():
         session.close()
 
 
-# ------------------------------
-# 1️⃣ AI가 생성한 루틴 저장
-# ------------------------------
-@router.post("/log")
-def log_exercise_plan(payload: ExerciseFeedbackCreate, session: Session = Depends(get_db)):
-    record = db.UserExerciseRec(
-        id=str(uuid4()),
-        user_id=payload.user_id,
-        date=payload.date,
-        day=payload.day,
-        focus=payload.focus,
-        exercises_json=payload.exercises,
-        created_at=date.today()
+@router.post("/exercise/feedback")
+def submit_exercise_feedback(body: ExerciseSessionInput, session: Session = Depends(get_db)):
+
+    user = session.query(db.User).filter(db.User.id == body.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    sess = db.ExerciseSession(
+        user_id=body.user_id,
+        session_name=body.session_name,
+        duration_min=body.duration_min,
+        intensity_score=body.intensity,
+        feedback=body.feedback
     )
-    session.add(record)
+    session.add(sess)
     session.commit()
-    return {"message": "✅ 운동 루틴 기록 완료", "rec_id": record.id}
+    session.refresh(sess)
 
-
-# ------------------------------
-# 2️⃣ 사용자 피드백 반영
-# ------------------------------
-@router.put("/{rec_id}")
-def update_feedback(rec_id: str, payload: ExerciseFeedbackUpdate, session: Session = Depends(get_db)):
-    rec = session.query(db.UserExerciseRec).filter(db.UserExerciseRec.id == rec_id).first()
-    if not rec:
-        raise HTTPException(status_code=404, detail="Record not found")
-
-    if payload.feedback_score is not None:
-        rec.feedback_score = payload.feedback_score
-    if payload.completed is not None:
-        rec.completed = payload.completed
+    # --------------------------------------
+    # ⭐ Option B: 운동 ID 포함해서 저장
+    # --------------------------------------
+    for item in body.items:
+        row = db.ExerciseSessionItem(
+            id=str(uuid.uuid4()),
+            session_id=sess.id,
+            exercise_id=item.exercise_id,     # ← 추가됨
+            exercise_name=item.name,
+            weight_kg=item.weight,
+            reps=item.reps,
+            sets=item.sets,
+            warmup_json=json.dumps(item.warmup, ensure_ascii=False)
+        )
+        session.add(row)
 
     session.commit()
-    return {"message": "✅ 피드백이 반영되었습니다", "rec_id": rec.id}
+
+    return {
+        "status": "success",
+        "session_id": sess.id,
+        "message": "운동 세션 피드백이 저장되었습니다."
+    }
