@@ -8,7 +8,8 @@ from datetime import datetime, date
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 import uuid
-
+from sqlalchemy import Boolean
+from sqlalchemy import text 
 
 # ----------------------
 # DB PATH 설정
@@ -57,6 +58,8 @@ class User(Base):
     skeletal_muscle = Column(Float, nullable=True)
     activity_level = Column(Float, default=1.2)
     goal = Column(String, default="maintenance")
+
+    
 
     exercise_logs = relationship("ExerciseLog", back_populates="user")
     meal_logs = relationship("MealLog", back_populates="user", cascade="all, delete-orphan")
@@ -220,6 +223,29 @@ class ExerciseSessionItem(Base):
 
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class Subscription(Base):
+    __tablename__ = "subscriptions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+
+    stripe_customer_id = Column(String, nullable=False, index=True)
+    stripe_subscription_id = Column(String, nullable=False, unique=True, index=True)
+
+    status = Column(String, nullable=False, default="active")  # "active", "canceled", ...
+
+    current_period_start = Column(DateTime, nullable=True)
+    current_period_end = Column(DateTime, nullable=True)
+
+    canceled_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    renewal_reminder_sent = Column(Boolean, default=False)  # D-3 알림
+    expire_reminder_sent = Column(Boolean, default=False)   # D-1 알림
+
+
+
 # ----------------------
 # init_db()
 # ----------------------
@@ -247,3 +273,33 @@ def init_db():
 
     if not inspector.has_table("exercise_session_items"):
         ExerciseSessionItem.__table__.create(bind=engine)
+     # NEW — Stripe Subscriptions
+    if not inspector.has_table("subscriptions"):
+        Subscription.__table__.create(bind=engine)
+    # ===========================
+    # PATCH — Add Subscription Columns if Missing
+    # ===========================
+    def patch_subscription_table():
+        inspector_local = inspect(engine)
+        columns = [col['name'] for col in inspector_local.get_columns("subscriptions")]
+
+        alter_statements = []
+
+        if "renewal_reminder_sent" not in columns:
+            alter_statements.append(
+                "ALTER TABLE subscriptions ADD COLUMN renewal_reminder_sent BOOLEAN DEFAULT 0"
+            )
+
+        if "expire_reminder_sent" not in columns:
+            alter_statements.append(
+                "ALTER TABLE subscriptions ADD COLUMN expire_reminder_sent BOOLEAN DEFAULT 0"
+            )
+
+        # 실제 ALTER 실행
+        with engine.connect() as conn:
+            for sql in alter_statements:
+                try:
+                    conn.execute(text(sql))   # ← text()로 감싸기
+                    print(f"[DB PATCH] Executed: {sql}")
+                except Exception as e:
+                    print(f"[DB PATCH ERROR] {sql} → {e}")

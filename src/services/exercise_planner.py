@@ -20,11 +20,18 @@ from src.utils.progression_engine import apply_progression
 from src.services.ml_progression_model import predict_next_weight
 from src.services.exercise_feedback_service import get_user_feedback_profile
 import pickle
+from src.services.exercise_ml_features import build_exercise_feature_vector
 
+
+from src.services.exercise_ml_features import build_exercise_feature_vector
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "exercise_model.pkl")
+MODEL_PATH = os.path.abspath(MODEL_PATH)
+
 with open(MODEL_PATH, "rb") as f:
     ML_MODEL = pickle.load(f)
+
+
 
 
 # ✅ 운동 DB 연결
@@ -336,20 +343,9 @@ def fetch_candidates(groups, equips, conditions, ctx):
 # ================================================
 # 머신러닝 기반 운동 점수 예측 함수 (임시/가상 모델)
 # ================================================
-def predict_exercise_ml_score(user_features: dict, exercise: dict) -> float:
-    # ML 입력 벡터 구성 (원하는 feature 선택 가능)
-    features = {
-        "avg_intensity": user_features.get("avg_intensity", 0),
-        "goal_code": 1 if user_features.get("goal") == "bulk" else 0,
-        "equip_match": 1 if exercise.get("equipments", "").lower()
-                          in user_features.get("preferred_equips", []) else 0,
-        "category_match": 1 if exercise.get("category", "").lower()
-                          in user_features.get("preferred_categories", []) else 0,
-    }
-
-    X = np.array([list(features.values())], dtype=float)
-
-    pred = ML_MODEL.predict(X)[0]  # 0~1 사이 값 권장
+def predict_exercise_ml_score(user_features, exercise):
+    fv = build_exercise_feature_vector(user_features, exercise)
+    pred = ML_MODEL.predict(fv.reshape(1, -1))[0]
     return max(0.05, min(1.0, float(pred)))
 
 

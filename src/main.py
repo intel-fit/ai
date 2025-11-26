@@ -17,6 +17,8 @@ from src.routers import exercise_score
 from src.routers import exercise_feedback
 from src.routers.home_feedback import router as home_feedback_router
 from src.routers import home 
+from src.routers import stripe
+
 
 
 
@@ -66,6 +68,7 @@ app.include_router(exercise_score.router)
 app.include_router(exercise_feedback.router)
 app.include_router(home_feedback_router)
 app.include_router(home.router) 
+app.include_router(stripe.router, prefix="/stripe", tags=["Stripe"])
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ from typing import Optional
 from pydantic import BaseModel, field_validator
 from datetime import date
 from typing import Optional
+from datetime import datetime
 
 
 # ----------------------
@@ -192,3 +193,9 @@ class ExerciseSessionInput(BaseModel):
     feedback: str                    # "like" | "dislike"
     items: List[ExerciseSessionItemInput]
 
+
+class SubscriptionStatus(BaseModel):
+    has_active_subscription: bool
+    status: Optional[str] = None
+    current_period_end: Optional[datetime] = None
+    stripe_subscription_id: Optional[str] = None
