@@ -105,6 +105,8 @@ class MealItem(Base):
     food_id = Column(Integer, ForeignKey("foods.id"), nullable=False)
     quantity_g = Column(Float, default=100.0)
 
+    time_taken = Column(String, nullable=True)
+
     meal = relationship("MealLog", back_populates="items")
     food = relationship("Food")
 
@@ -272,6 +274,39 @@ class Subscription(Base):
     expire_reminder_sent = Column(Boolean, default=False)   # D-1 알림
 
 
+# ----------------------
+# Daily Nutrition Goal (영양 목표 저장)
+# ----------------------
+class DailyNutritionGoal(Base):
+    __tablename__ = "daily_nutrition_goals"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    date = Column(Date, nullable=False, index=True)
+
+    target_calorie = Column(Float, default=0)
+    target_protein = Column(Float, default=0)
+    target_fat = Column(Float, default=0)
+    target_carb = Column(Float, default=0)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "date", name="_user_date_goal_uc"),
+    )
+
+def patch_meal_item_time_taken():
+    inspector = inspect(engine)
+    columns = [col['name'] for col in inspector.get_columns("meal_items")]
+
+    if "time_taken" not in columns:
+        with engine.connect() as conn:
+            conn.execute(text(
+                "ALTER TABLE meal_items ADD COLUMN time_taken VARCHAR(50)"
+            ))
+            print("[DB PATCH] Added time_taken to meal_items")
+
 
 # ----------------------
 # init_db()
@@ -307,6 +342,12 @@ def init_db():
      # NEW — Stripe Subscriptions
     if not inspector.has_table("subscriptions"):
         Subscription.__table__.create(bind=engine)
+    
+    if not inspector.has_table("daily_nutrition_goals"):
+        DailyNutritionGoal.__table__.create(bind=engine)
+
+    # MealItem time_taken 패치 호출
+    patch_meal_item_time_taken()
     # ===========================
     # PATCH — Add Subscription Columns if Missing
     # ===========================
@@ -334,3 +375,4 @@ def init_db():
                     print(f"[DB PATCH] Executed: {sql}")
                 except Exception as e:
                     print(f"[DB PATCH ERROR] {sql} → {e}")
+

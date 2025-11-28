@@ -3,13 +3,27 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from src import db
 from src.usda_api import search_usda_food
-from src.schemas import FoodOut, MealLogOut, MealItemOut
+from src.schemas import FoodOut, MealLogOut, MealItemOut, ManualCalorieInput
+from src.services.nutrition import (
+    calculate_bmr_katch_mcardle,
+    calculate_bmr_harris_benedict,
+    calculate_tdee,
+    calculate_goal_calories,
+    calculate_macros
+)
+from src.schemas import ManualGoalRequest
+from src.schemas import (
+    MealNameUpdateRequest,
+    MealDateUpdateRequest,
+    MealTimeUpdateRequest,
+)
+
 import os
 import json
 import re
 import requests
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime,date
 from typing import List,  Optional
 # 맨 위에 추가
 from src.services.summary import recompute_daily_summaries
@@ -841,41 +855,234 @@ def delete_meal(
 
 @router.get("/daily_goal", response_model=dict)
 def get_daily_goal(user_id: str, session: Session = Depends(get_db)):
-
+    
     user = session.query(db.User).get(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # 1. BMR 계산 (Mifflin–St Jeor)
-    if user.sex.lower() == "male":
-        bmr = 10 * user.weight + 6.25 * user.height - 5 * user.age + 5
+    # 1) BMR 계산: 체지방이 있으면 Katch-McArdle, 없으면 Harris-Benedict
+    if user.body_fat is not None:
+        bmr = calculate_bmr_katch_mcardle(user.weight, user.body_fat)
     else:
-        bmr = 10 * user.weight + 6.25 * user.height - 5 * user.age - 161
+        bmr = calculate_bmr_harris_benedict(user.weight, user.height, user.age, user.sex)
 
-    # 2. TDEE
-    tdee = bmr * user.activity_level
+    # 2) TDEE = BMR * 활동레벨
+    tdee = calculate_tdee(bmr, user.activity_level)
 
-    # 3. 목표 칼로리
-    if user.goal == "fat_loss":
-        goal_kcal = tdee * 0.8
-        ratio = {"protein": 0.30, "carbs": 0.40, "fat": 0.30}
-    elif user.goal == "hypertrophy":
-        goal_kcal = tdee * 1.1
-        ratio = {"protein": 0.25, "carbs": 0.50, "fat": 0.25}
-    else:  # maintenance
-        goal_kcal = tdee
-        ratio = {"protein": 0.25, "carbs": 0.45, "fat": 0.30}
+    # 3) 목표 칼로리 (bulk / diet / lean / etc)
+    target_calorie = calculate_goal_calories(tdee, user.goal)
 
-    # 4. 탄단지 그램 계산 (1g: P4 / C4 / F9 kcal)
-    protein_g = (goal_kcal * ratio["protein"]) / 4
-    carbs_g = (goal_kcal * ratio["carbs"]) / 4
-    fat_g = (goal_kcal * ratio["fat"]) / 9
+    # 4) 목표 단백질/지방/탄수 계산
+    protein_g, fat_g, carbs_g = calculate_macros(
+        weight=user.weight,
+        goal_calories=target_calorie,
+        goal=user.goal,
+        skeletal_muscle=user.skeletal_muscle
+    )
+
+    today = date.today()
+
+    # 5) DB 저장 (있으면 업데이트, 없으면 생성)
+    existing = (
+        session.query(db.DailyNutritionGoal)
+        .filter_by(user_id=user_id, date=today)
+        .first()
+    )
+
+    if existing:
+        existing.target_calorie = target_calorie
+        existing.target_protein = protein_g
+        existing.target_fat = fat_g
+        existing.target_carb = carbs_g
+        existing.updated_at = datetime.utcnow()
+    else:
+        new_goal = db.DailyNutritionGoal(
+            user_id=user_id,
+            date=today,
+            target_calorie=target_calorie,
+            target_protein=protein_g,
+            target_fat=fat_g,
+            target_carb=carbs_g,
+        )
+        session.add(new_goal)
+
+    session.commit()
 
     return {
         "tdee": round(tdee, 1),
-        "goal_kcal": round(goal_kcal, 1),
+        "target_calorie": round(target_calorie, 1),
         "protein_g": round(protein_g, 1),
-        "carbs_g": round(carbs_g, 1),
         "fat_g": round(fat_g, 1),
-        "ratio": ratio
+        "carbs_g": round(carbs_g, 1),
+    }
+
+@router.post("/nutrition-goal/manual-calorie")
+def set_manual_calorie(
+    req: ManualGoalRequest,
+    session: Session = Depends(get_db)
+):
+    user_id = req.user_id
+    target_calorie = req.target_calorie
+    date_obj = (
+        datetime.strptime(req.date, "%Y-%m-%d").date()
+        if req.date else date.today()
+    )
+
+    user = session.query(db.User).get(user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    protein_g, fat_g, carbs_g = calculate_macros(
+        user.weight,
+        target_calorie,
+        user.goal,
+        user.skeletal_muscle
+    )
+
+    existing = (
+        session.query(db.DailyNutritionGoal)
+        .filter_by(user_id=user_id, date=date_obj)
+        .first()
+    )
+
+    if existing:
+        existing.target_calorie = target_calorie
+        existing.target_protein = protein_g
+        existing.target_fat = fat_g
+        existing.target_carb = carbs_g
+        existing.updated_at = datetime.utcnow()
+    else:
+        session.add(
+            db.DailyNutritionGoal(
+                user_id=user_id,
+                date=date_obj,
+                target_calorie=target_calorie,
+                target_protein=protein_g,
+                target_fat=fat_g,
+                target_carb=carbs_g,
+            )
+        )
+
+    session.commit()
+
+    return {
+        "date": str(date_obj),
+        "target_calorie": target_calorie,
+        "protein_g": protein_g,
+        "fat_g": fat_g,
+        "carbs_g": carbs_g
+    }
+
+@router.get("/nutrition-goal/get", response_model=dict)
+def get_saved_nutrition_goal(
+    user_id: str,
+    date_str: str | None = None,
+    session: Session = Depends(get_db)
+):
+    """
+    🔎 저장된 DailyNutritionGoal 조회 전용 API
+    - 자동 계산 실행하지 않음
+    - DB 값만 반환
+    - 값이 없으면 not found 반환 또는 빈 값 반환 가능
+    """
+
+    # 조회 날짜 설정
+    target_date = (
+        datetime.strptime(date_str, "%Y-%m-%d").date()
+        if date_str else date.today()
+    )
+
+    # DB 조회
+    goal = (
+        session.query(db.DailyNutritionGoal)
+        .filter_by(user_id=user_id, date=target_date)
+        .first()
+    )
+
+    if not goal:
+        return {
+            "user_id": user_id,
+            "date": str(target_date),
+            "exists": False,
+            "message": "No nutrition goal saved for this date."
+        }
+
+    return {
+        "user_id": user_id,
+        "date": str(target_date),
+        "exists": True,
+        "target_calorie": round(goal.target_calorie, 1),
+        "protein_g": round(goal.target_protein, 1),
+        "fat_g": round(goal.target_fat, 1),
+        "carbs_g": round(goal.target_carb, 1),
+    }
+
+
+@router.put("/meal/update_name", response_model=dict)
+def update_meal_name(
+    req: MealNameUpdateRequest,
+    session: Session = Depends(get_db)
+):
+    meal = session.query(db.MealLog).get(req.meal_id)
+    if not meal:
+        raise HTTPException(status_code=404, detail="Meal not found")
+
+    if meal.user_id != req.user_id:
+        raise HTTPException(status_code=403, detail="Not allowed")
+
+    meal.meal_name = req.meal_name
+    session.commit()
+
+    return {
+        "status": "meal_name_updated",
+        "meal_id": meal.id,
+        "meal_name": meal.meal_name
+    }
+
+@router.put("/meal/update_date", response_model=dict)
+def update_meal_date(
+    req: MealDateUpdateRequest,
+    session: Session = Depends(get_db)
+):
+    meal = session.query(db.MealLog).get(req.meal_id)
+    if not meal:
+        raise HTTPException(statusstatus_code=404, detail="Meal not found")
+
+    if meal.user_id != req.user_id:
+        raise HTTPException(status_code=403, detail="Not allowed")
+
+    try:
+        new_date = datetime.strptime(req.date, "%Y-%m-%d").date()
+    except:
+        raise HTTPException(status_code=400, detail="Invalid date format (YYYY-MM-DD required)")
+
+    meal.date = new_date
+    session.commit()
+
+    return {
+        "status": "meal_date_updated",
+        "meal_id": meal.id,
+        "new_date": str(meal.date)
+    }
+
+
+@router.put("/meal/update_time", response_model=dict)
+def update_meal_time(
+    req: MealTimeUpdateRequest,
+    session: Session = Depends(get_db)
+):
+    meal = session.query(db.MealLog).get(req.meal_id)
+    if not meal:
+        raise HTTPException(status_code=404, detail="Meal not found")
+
+    if meal.user_id != req.user_id:
+        raise HTTPException(status_code=403, detail="Not allowed")
+
+    meal.time_taken = req.time_taken
+    session.commit()
+
+    return {
+        "status": "meal_time_updated",
+        "meal_id": meal.id,
+        "time_taken": meal.time_taken
     }

@@ -201,3 +201,26 @@ class SubscriptionStatus(BaseModel):
     status: Optional[str] = None
     current_period_end: Optional[datetime] = None
     stripe_subscription_id: Optional[str] = None
+
+class ManualCalorieInput(BaseModel):
+    target_calorie: int
+
+class ManualGoalRequest(BaseModel):
+    user_id: str
+    target_calorie: float
+    date: str | None = None
+
+class MealNameUpdateRequest(BaseModel):
+    meal_id: int
+    user_id: str
+    meal_name: str
+
+class MealDateUpdateRequest(BaseModel):
+    meal_id: int
+    user_id: str
+    date: str   # YYYY-MM-DD
+
+class MealTimeUpdateRequest(BaseModel):
+    meal_id: int
+    user_id: str
+    time_taken: str   # HH:MM
