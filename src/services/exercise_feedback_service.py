@@ -32,19 +32,51 @@ def _infer_group(ex_name: str):
 # ===========================================
 # MAIN: 유저 피드백 프로필 생성
 # ===========================================
+from src import db
+import collections
+import numpy as np
+from sqlalchemy.orm import Session
+
 def get_user_feedback_profile(user_id: str, session: Session):
     """
-    유저가 지금까지 수행한 ExerciseSession 기반으로
-    - 운동별 선호도 가중치(weights)
-    - group 선호도 (like_groups / dislike_groups)
-    - 카테고리/장비 기반 선호도
-    - 머신러닝 feature dictionary (ml_features)
+    유저 전체 운동 피드백을 결합하여
+    - 운동별 like/dislike
+    - 운동별 heavy/light (무게 조정용)
+    - 기존 ExerciseSession 기반 가중치
+    - 그룹/장비 기반 선호
+    - ML feature
 
-    를 모두 결합한 하이브리드 피드백 프로필 생성.
+    까지 포함한 하이브리드 피드백을 생성한다.
     """
-    # ----------------------------------------------------
-    # ① 운동 세션 가져오기
-    # ----------------------------------------------------
+
+    # ==========================================
+    # ① NEW: exercise_feedback 테이블 기반 운동별 피드백 가져오기
+    # ==========================================
+    fb_rows = (
+        session.query(db.ExerciseFeedback)
+        .filter(db.ExerciseFeedback.user_id == user_id)
+        .order_by(db.ExerciseFeedback.created_at.desc())
+        .all()
+    )
+
+    like_exercises = set()
+    dislike_exercises = set()
+    heavy_feedback = set()
+    light_feedback = set()
+
+    for r in fb_rows:
+        if r.feedback_type == "like":
+            like_exercises.add(r.exercise_id)
+        elif r.feedback_type == "dislike":
+            dislike_exercises.add(r.exercise_id)
+        elif r.feedback_type == "heavy":
+            heavy_feedback.add(r.exercise_id)
+        elif r.feedback_type == "light":
+            light_feedback.add(r.exercise_id)
+
+    # ==========================================
+    # ② 기존 ExerciseSession 기반 로직(그대로 유지)
+    # ==========================================
     sessions = (
         session.query(db.ExerciseSession)
         .filter(db.ExerciseSession.user_id == user_id)
@@ -52,12 +84,14 @@ def get_user_feedback_profile(user_id: str, session: Session):
         .all()
     )
 
-    if not sessions:
-        # 아무 로그 없으면 기본값 반환
+    # 세션이 하나도 없으면 기본값 반환
+    if not sessions and not fb_rows:
         return {
             "weights": {},
             "like_exercises": set(),
             "dislike_exercises": set(),
+            "heavy_feedback": set(),
+            "light_feedback": set(),
             "like_groups": set(),
             "dislike_groups": set(),
             "like_equip": set(),
@@ -70,22 +104,14 @@ def get_user_feedback_profile(user_id: str, session: Session):
             }
         }
 
-    # ----------------------------------------------------
-    # ② 기본 가중치 1.0
-    # ----------------------------------------------------
     weights = collections.defaultdict(lambda: 1.0)
-
-    like_exercises = set()
-    dislike_exercises = set()
     like_groups = collections.Counter()
     dislike_groups = collections.Counter()
     like_equips = collections.Counter()
     dislike_equips = collections.Counter()
     intensities = []
 
-    # ----------------------------------------------------
-    # ③ 세션 반복 → 가중치 계산
-    # ----------------------------------------------------
+    # 기존 세션 기반 가중치 계산
     for sess in sessions:
         items = (
             session.query(db.ExerciseSessionItem)
@@ -93,7 +119,7 @@ def get_user_feedback_profile(user_id: str, session: Session):
             .all()
         )
 
-        # like/dislike 세션 전체 가중치
+        # 세션 피드백(전체 운동에 적용되는 가중치)
         if sess.feedback == "like":
             factor = 1.20
         elif sess.feedback == "dislike":
@@ -108,13 +134,7 @@ def get_user_feedback_profile(user_id: str, session: Session):
             ex_name = it.exercise_name
             weights[ex_name] *= factor
 
-            # 개별 운동 선호 set 등록
-            if factor > 1.0:
-                like_exercises.add(it.exercise_id)
-            elif factor < 1.0:
-                dislike_exercises.add(it.exercise_id)
-
-            # 운동 그룹 추론
+            # 운동 그룹 추론 (기존 로직 그대로)
             g = _infer_group(ex_name)
             if g:
                 if factor > 1.0:
@@ -122,43 +142,46 @@ def get_user_feedback_profile(user_id: str, session: Session):
                 elif factor < 1.0:
                     dislike_groups[g] += 1
 
-            # 장비/카테고리
-            if it.exercise_name and factor != 1.0:
-                equip = (it.exercise_name or "").lower()
-                if factor > 1.0:
-                    like_equips[equip] += 1
-                else:
-                    dislike_equips[equip] += 1
+            equip = (it.exercise_name or "").lower()
+            if factor > 1.0:
+                like_equips[equip] += 1
+            elif factor < 1.0:
+                dislike_equips[equip] += 1
 
-    # ----------------------------------------------------
-    # ④ 머신러닝 Feature 준비
-    # ----------------------------------------------------
+    # ==========================================
+    # ③ Machine Learning feature (기존 유지)
+    # ==========================================
     avg_intensity = float(np.mean(intensities)) if intensities else 0.5
 
-    # 장비/카테고리 Top preference
     preferred_equips = [e for e, c in like_equips.items() if c >= 1]
     preferred_categories = list(like_groups.keys())
 
     ml_features = {
-        "goal": "maintenance",        # TODO: user table goal 반영 가능
+        "goal": "maintenance", 
         "avg_intensity": avg_intensity,
         "preferred_equips": preferred_equips,
         "preferred_categories": preferred_categories
     }
 
-    # ----------------------------------------------------
-    # ⑤ 최종 패키징
-    # ----------------------------------------------------
+    # ==========================================
+    # ④ 최종 패키징: 기존 + NEW
+    # ==========================================
     return {
+        # 기존
         "weights": dict(weights),
-        "like_exercises": like_exercises,
-        "dislike_exercises": dislike_exercises,
         "like_groups": set(like_groups.keys()),
         "dislike_groups": set(dislike_groups.keys()),
         "like_equip": set(preferred_equips),
         "dislike_equip": set([e for e, c in dislike_equips.items() if c >= 1]),
-        "ml_features": ml_features
+        "ml_features": ml_features,
+
+        # NEW (운동별 단위 피드백)
+        "like_exercises": like_exercises,
+        "dislike_exercises": dislike_exercises,
+        "heavy_feedback": heavy_feedback,
+        "light_feedback": light_feedback,
     }
+
 
 
 

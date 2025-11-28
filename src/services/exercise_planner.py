@@ -28,14 +28,29 @@ from src.services.exercise_ml_features import build_exercise_feature_vector
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "exercise_model.pkl")
 MODEL_PATH = os.path.abspath(MODEL_PATH)
 
-with open(MODEL_PATH, "rb") as f:
-    ML_MODEL = pickle.load(f)
+# =======================
+# ML 모델 Optional Load
+# =======================
+import pickle
+
+def load_ml_model():
+    if not os.path.exists(MODEL_PATH):
+        print("⚠ ML 모델이 없어 Rule-based만 사용합니다.")
+        return None
+    try:
+        with open(MODEL_PATH, "rb") as f:
+            return pickle.load(f)
+    except Exception as e:
+        print("⚠ ML 모델 로딩 실패 → Rule-based로 진행:", e)
+        return None
+
+ML_MODEL = load_ml_model()
 
 
 
 
 # ✅ 운동 DB 연결
-EXERCISE_DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "exercise.db")
+EXERCISE_DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "food_db.sqlite")
 if not os.path.exists(EXERCISE_DB_PATH):
     raise FileNotFoundError(f"⚠️ 운동 DB 파일을 찾을 수 없습니다: {EXERCISE_DB_PATH}")
 exercise_engine = create_engine(f"sqlite:///{EXERCISE_DB_PATH}", connect_args={"check_same_thread": False})
@@ -62,11 +77,45 @@ FOCUS_QUOTAS = {
         ("glutes", 1),
         ("calves", 1),
     ],
+    "Arms": [
+    ("biceps", 1),
+    ("triceps", 1),
+    ("forearms", 1)   # 선택사항
+    ],
+
     # 기타 분할도 확장 가능
     "Upper": [("chest",1),("back",1),("shoulders",1),("biceps",1),("triceps",1)],
     "Lower": [("quads",1),("hamstrings",1),("glutes",1),("calves",1),("core",1)],
     "Core":  [("core",2)]
 }
+FOCUS_ALIAS = {
+    "arm": "Arms",
+    "arms": "Arms",
+    "bicep": "Arms",
+    "biceps": "Arms",
+    "tricep": "Arms",
+    "triceps": "Arms",
+
+    "leg": "Legs",
+    "legs": "Legs",
+    "lowerbody": "Legs",
+    
+    "upperbody": "Upper",
+    "upper": "Upper",
+
+    "push": "Push",
+    "pull": "Pull",
+
+    "core": "Core",
+    "abs": "Core",
+    "ab": "Core",
+
+    "chest": "Push",
+    "back": "Pull",
+    "shoulder": "Push",
+    "shoulders": "Push",
+}
+
 EXERCISE_TIME_FACTORS = {
     "compound": {"time_per_set_sec": 40, "time_per_rep_sec": 2.4},
     "isolation": {"time_per_set_sec": 32, "time_per_rep_sec": 2.2},
@@ -83,10 +132,12 @@ FOCUS_INCLUDE = {
     "Push": {"chest", "shoulders", "triceps"},
     "Pull": {"back", "biceps"},
     "Legs": {"quads", "hamstrings", "glutes", "calves", "core"},
+    "Arms": {"biceps", "triceps"},
 }
 FOCUS_EXCLUDE = {
     "Push": {"biceps", "forearms"},   # 전완/이두 과다 진입 방지
     "Pull": {"triceps",},             # 삼두 과다 진입 방지
+    "Arms": set()
     # Legs는 제외 규칙 없음
 }
 
@@ -162,7 +213,7 @@ def generate_week_plan(ctx: UserExerciseContext, session: Session):
         )
         used_ids.update(e["exerciseId"] for e in chosen)
 
-        session_exs = attach_sets_reps(chosen, ctx)
+        session_exs = attach_sets_reps(chosen, ctx, feedback_profile)
         plan.append({"day": day, "focus": focus, "exercises": session_exs})
 
         # 목표 시간이 있는 경우, 세션 시간이 너무 짧으면 운동을 추가
@@ -195,7 +246,7 @@ def generate_week_plan(ctx: UserExerciseContext, session: Session):
                 # 최대 2개 추가
                 for _, extra in extras[:2]:
                     used_ids.add(extra["exerciseId"])
-                    session_exs.append(attach_sets_reps([extra], ctx)[0])
+                    session_exs.append(attach_sets_reps([extra], ctx, feedback_profile)[0])
                     cur_min = est_session_min(session_exs)
                     if cur_min >= ctx.target_time_min * MIN_RATIO:
                         break
@@ -261,21 +312,78 @@ def determine_split(ctx: UserExerciseContext) -> List[str]:
 # ===========================
 # 부위 우선순위 (인바디 + 연령대)
 # ===========================
+# ===========================
+# 부위 우선순위 (인바디 + 연령대) — 완전 안전 버전
+# ===========================
+INBODY_ALIAS = {
+    # 상체/하체 개괄적 지표
+    "upper": ["chest", "back", "shoulders", "biceps", "triceps", "forearms"],
+    "lower": ["legs", "quads", "hamstrings", "glutes", "calves", "core"],
+
+    # 팔 계열
+    "arm": ["biceps","triceps","forearms"],
+    "arms": ["biceps","triceps","forearms"],
+    "bicep": ["biceps"],
+    "biceps": ["biceps"],
+    "tricep": ["triceps"],
+    "triceps": ["triceps"],
+
+    # 푸쉬/풀
+    "push": ["chest","shoulders","triceps"],
+    "pull": ["back","biceps"],
+
+    # 코어
+    "core": ["core"],
+    "abs":  ["core"],
+    "ab":   ["core"],
+
+    # 하체
+    "leg": ["legs","glutes","hamstrings","quads","calves"],
+    "legs": ["legs","glutes","hamstrings","quads","calves"],
+}
+
 def compute_muscle_priority(ctx: UserExerciseContext) -> Dict[str, float]:
+    """
+    인바디 raw key → 실제 근육군 키로 안전 매핑 후 priority 반영하는 완전 안전 버전.
+    MUSCLE_KEYWORDS와 항상 호환됨.
+    """
     base = {k: 1.0 for k in MUSCLE_KEYWORDS.keys()}
     ib = ctx.inbody.dict()
     ap = age_profile(ctx.age)
-    for group, vals in ib.items():
-        m, f = vals.get("muscle_score"), vals.get("fat_score")
-        if m is not None:
-            base[group] += max(0.0, -m) * 0.8
-        if f is not None:
-            base[group] += max(0.0, f) * (0.6 if ctx.goal in ["fat_loss","functional"] else 0.3)
+
+    for raw_group, vals in ib.items():
+        key = raw_group.lower().strip()
+
+        # 1) alias 매핑 → 실제 근육군 리스트
+        if key in INBODY_ALIAS:
+            groups = INBODY_ALIAS[key]
+        else:
+            groups = [key]
+
+        # 2) 매핑된 근육군을 실제 base key에만 반영
+        for g in groups:
+            if g not in base:
+                continue  # 존재하지 않으면 skip
+
+            m = vals.get("muscle_score")
+            f = vals.get("fat_score")
+
+            if m is not None:
+                base[g] += max(0.0, -m) * 0.8
+
+            if f is not None:
+                base[g] += max(0.0, f) * (
+                    0.6 if ctx.goal in ["fat_loss","functional"] else 0.3
+                )
+
+    # 3) 연령대 보정
     if ap["band"] == "senior":
         base["core"] += ap["core_bias"]
         base["legs"] += 0.5
         base["glutes"] += 0.5
+
     return base
+
 
 
 # ===========================
@@ -344,9 +452,16 @@ def fetch_candidates(groups, equips, conditions, ctx):
 # 머신러닝 기반 운동 점수 예측 함수 (임시/가상 모델)
 # ================================================
 def predict_exercise_ml_score(user_features, exercise):
-    fv = build_exercise_feature_vector(user_features, exercise)
-    pred = ML_MODEL.predict(fv.reshape(1, -1))[0]
-    return max(0.05, min(1.0, float(pred)))
+    if ML_MODEL is None:
+        return 0.0  # 모델 없으면 영향 0
+    
+    try:
+        fv = build_exercise_feature_vector(user_features, exercise)
+        pred = ML_MODEL.predict(fv.reshape(1, -1))[0]
+        return max(0.05, min(1.0, float(pred)))
+    except:
+        return 0.0
+
 
 
 # ===========================
@@ -418,16 +533,18 @@ def pick_exercises(
 
         # 🔥 피드백 기반 가중치 반영
         final_w = apply_feedback_weight(base_w, c)
-                # -----------------------------------------
-        # 🔥 ML 점수 기반 가중치 추가
         # -----------------------------------------
-        if feedback_profile and "ml_features" in feedback_profile:
-            ml_score = predict_exercise_ml_score(
-                feedback_profile["ml_features"],
-                c
-            )
-            # ML 점수는 가중치에 곱해주는 방식 (하이브리드)
-            final_w *= (1.0 + ml_score)
+        # 🔥 ML 점수 기반 가중치 추가 (모델이 있을 때만)
+        # -----------------------------------------
+        if ML_MODEL is not None and feedback_profile and "ml_features" in feedback_profile:
+            try:
+                ml_score = predict_exercise_ml_score(
+                    feedback_profile["ml_features"],
+                    c
+                )
+                final_w *= (1.0 + ml_score)
+            except Exception as e:
+                print("⚠ ML scoring failed → skip:", e)
 
 
         if final_w > 0:
@@ -560,7 +677,7 @@ def debug_exercise_weights(weighted_list, chosen):
 # ===========================
 # 세트/반복/강도 설정
 # ===========================
-def attach_sets_reps(ex_list: List[dict], ctx: UserExerciseContext) -> List[dict]:
+def attach_sets_reps(ex_list: List[dict], ctx: UserExerciseContext,  feedback_profile=None) -> List[dict]:
     p = GOAL_PARAMS[ctx.goal].copy()
     ap = age_profile(ctx.age)
     # 숙련도 보정
@@ -619,6 +736,21 @@ def attach_sets_reps(ex_list: List[dict], ctx: UserExerciseContext) -> List[dict
         alpha = 0.6
         final_weight = round(alpha * start_load + (1 - alpha) * predicted_weight, 1)
 
+        # ============================================
+        # 🔥 NEW: heavy/light 피드백 기반 무게 조정
+        # ============================================
+        if feedback_profile:
+            ex_id = e["exerciseId"]
+
+            # 사용자가 "무거워요" → 다음 추천에서 -10%
+            if ex_id in feedback_profile.get("heavy_feedback", set()):
+                final_weight = round(final_weight * 0.90, 1)
+
+            # 사용자가 "가벼워요" → 다음 추천에서 +10%
+            if ex_id in feedback_profile.get("light_feedback", set()):
+                final_weight = round(final_weight * 1.10, 1)
+
+
         tempo = suggest_tempo(ctx.goal)
         rir = suggest_rir(ctx.goal, ctx.experience)
 
@@ -651,7 +783,7 @@ def attach_sets_reps(ex_list: List[dict], ctx: UserExerciseContext) -> List[dict
             "weight_kg": final_weight,
             "rir": rir,
             "tempo": tempo,
-            "warmups": warmups,
+            "warmup": warmups,
             "note": "AI-weight hybrid applied"
         })
     return out
@@ -858,3 +990,95 @@ def _resolve_day_target(ctx, day_index: int) -> Optional[float]:
         v = t.get(day_index)
         return float(v) if v and v > 0 else None
     return None
+
+
+# ============================================
+# ⭐ DAILY RECOMMENDER (NEW)
+# ============================================
+def generate_daily_plan(ctx: UserExerciseContext, session: Session):
+    """
+    단일 날짜용 운동 추천.
+    """
+    equips = ctx.available_equipment or (
+        DEFAULT_HOME_EQUIPS if ctx.environment == "home" else None
+    )
+
+    feedback_profile = get_user_feedback_profile(ctx.user_id, session)
+
+    # ----------------------
+    # 1) focus 결정 (lower로 통일)
+    # ----------------------
+    priority = compute_muscle_priority(ctx)
+
+    # ----------------------
+    # 1) focus 결정 (+ alias 처리)
+    # ----------------------
+    raw_focus = None
+
+    if getattr(ctx, "focus_muscle", None):
+        raw_focus = ctx.focus_muscle.lower().strip()
+    else:
+        raw_focus = max(priority, key=priority.get).lower().strip()
+
+    # alias 변환
+    focus_key = FOCUS_ALIAS.get(raw_focus, raw_focus).capitalize()
+
+    groups = FOCUS_TO_GROUPS.get(focus_key, [])
+
+    # fallback
+    if not groups:
+        print(f"⚠️ Daily focus '{raw_focus}' → '{focus_key}' 매핑 실패 → Upper로 fallback")
+        focus_key = "Upper"
+        groups = FOCUS_TO_GROUPS["Upper"]
+
+
+    # 안전장치: groups가 비었으면 arms/week priority 기반 fallback
+    if not groups:
+        print(f"⚠️ Daily focus '{raw_focus}' → '{focus_key}' 매핑 실패 → Upper로 fallback")
+        focus_key = "Upper"
+        groups = FOCUS_TO_GROUPS["Upper"]
+
+    # ----------------------
+    # 2) 후보 운동
+    # ----------------------
+    candidates = fetch_candidates(groups, equips, ctx.health_conditions, ctx)
+
+    # ----------------------
+    # 3) 운동 픽
+    # ----------------------
+    chosen = pick_exercises(
+        candidates,
+        priority,
+        groups,
+        k=5,
+        used_ids=set(),
+        focus=focus_key,
+        feedback_profile=feedback_profile
+    )
+
+    # ----------------------
+    # 4) 세트/반복 설정
+    # ----------------------
+    session_exs = attach_sets_reps(chosen, ctx, feedback_profile)
+
+    # ----------------------
+    # 5) 시간 기반 조정
+    # ----------------------
+    if getattr(ctx, "target_time_min", None):
+        temp = [{"day": 1, "focus": focus_key, "exercises": session_exs}]
+        temp = adjust_to_target_time(temp, ctx)
+        session_exs = temp[0]["exercises"]
+
+    # ----------------------
+    # 7) 메트릭 계산
+    # ----------------------
+    metrics = estimate_session_metrics(
+        [{"day": 1, "focus": focus_key, "exercises": session_exs}],
+        user_weight_kg=(ctx.weight_kg or 70.0)
+    )
+
+    return {
+        "focus": focus_key,
+        "exercises": session_exs,
+        "metrics": metrics
+    }

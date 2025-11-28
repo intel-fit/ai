@@ -32,6 +32,7 @@ class InBodySnapshot(BaseModel):
 
 class UserExerciseContext(BaseModel):
     """AI 운동 루틴 추천을 위한 전체 사용자 프로필"""
+    user_id: str
     age: int
     sex: Literal["male", "female"]
     goal: Goal = "hypertrophy"
@@ -183,6 +184,7 @@ class ExerciseSessionItemInput(BaseModel):
     reps: int
     sets: int
     warmup: Optional[list] = None
+    feedback: List[str] = []
 
 
 class ExerciseSessionInput(BaseModel):

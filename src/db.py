@@ -191,6 +191,30 @@ class UserExerciseRec(Base):
     completed = Column(Boolean, default=False)
     created_at = Column(Date, nullable=False)
 
+class ExerciseFeedback(Base):
+    __tablename__ = "exercise_feedback"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # 어떤 유저가
+    user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+
+    # 어떤 운동에 대해 (exerciseCategory.exerciseId 그대로 저장)
+    exercise_id = Column(String, nullable=False, index=True)
+    exercise_name = Column(String, nullable=False)
+
+    # 피드백 타입: 'like', 'dislike', 'heavy', 'light'
+    feedback_type = Column(String, nullable=False, index=True)
+
+    # 선택: 피드백 당시 실제 들었던 무게 (있으면 나중에 분석에 도움됨)
+    weight_kg = Column(Float, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # (옵션) 역참조 필요하면 관계도 걸 수 있음
+    # user = relationship("User")
+
+
 # ==================================================
 # NEW — Exercise Session + Items (User performed logs)
 # ==================================================
@@ -205,6 +229,8 @@ class ExerciseSession(Base):
     intensity_score = Column(Float)
     feedback = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User")
 
 class ExerciseSessionItem(Base):
     __tablename__ = "exercise_session_items"
@@ -222,6 +248,7 @@ class ExerciseSessionItem(Base):
     warmup_json = Column(Text, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
+
 
 class Subscription(Base):
     __tablename__ = "subscriptions"
@@ -266,6 +293,10 @@ def init_db():
     # AI 추천
     if not inspector.has_table("user_exercise_recs"):
         UserExerciseRec.__table__.create(bind=engine)
+    
+    # NEW — Exercise Feedback (운동별 좋아요/싫어요/무거움/가벼움)
+    if not inspector.has_table("exercise_feedback"):
+        ExerciseFeedback.__table__.create(bind=engine)
 
     # NEW — Exercise Sessions
     if not inspector.has_table("exercise_sessions"):

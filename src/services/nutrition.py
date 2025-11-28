@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta, date
 from dateutil.relativedelta import relativedelta
 from src.services.ml_predictor import predict_next_week_activity, predict_goal_calories_ml
+import numpy as np
 
 def calculate_bmr_katch_mcardle(weight: float, body_fat: float) -> float:
     """
