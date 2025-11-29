@@ -4,7 +4,7 @@ import json
 from sqlalchemy.orm import Session
 from src.db import Memory
 from datetime import datetime
-from src.routers.chat_coach import call_gemini 
+
 
 # ---------------------------
 # 기본 로딩 함수

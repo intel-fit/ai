@@ -15,6 +15,7 @@ from src.utils.memory_utils import (
     update_mid_term_summary,
     update_long_term_memory,
 )
+from src.utils.llm_utils import call_gemini
 
 
 from src import db
@@ -42,66 +43,7 @@ class ChatCoachRequest(BaseModel):
     coach_style: str | None = "default"  # "pro" | "friend" | "soft" | "drill" | ...
 
 
-# =========================
-# Gemini 설정
-# =========================
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_URL = os.getenv(
-    "GEMINI_CHAT_URL",
-    # 필요하면 .env에서 GEMINI_CHAT_URL 로 override 가능
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
-)
 
-
-def call_gemini(prompt: str) -> str:
-    """
-    Gemini API 호출 (텍스트 전용)
-    """
-    if not GEMINI_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="GEMINI_API_KEY is not set in environment variables.",
-        )
-
-    headers = {
-        "Content-Type": "application/json",
-        "X-goog-api-key": GEMINI_API_KEY,
-    }
-
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt}
-                ]
-            }
-        ]
-    }
-
-    try:
-        resp = requests.post(GEMINI_URL, headers=headers, json=payload, timeout=30)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gemini request failed: {e}")
-
-    if resp.status_code != 200:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Gemini API error: {resp.status_code} {resp.text}",
-        )
-
-    data = resp.json()
-    # 기본 응답 구조: candidates[0].content.parts[0].text
-    try:
-        text = (
-            data["candidates"][0]["content"]["parts"][0]["text"]
-        )
-    except Exception:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Unexpected Gemini response format: {json.dumps(data)[:500]}",
-        )
-
-    return text
 
 
 # =========================
