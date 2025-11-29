@@ -10,6 +10,9 @@ from sqlalchemy.orm import sessionmaker, relationship
 import uuid
 from sqlalchemy import Boolean
 from sqlalchemy import text 
+from sqlalchemy.sql import func
+import json
+
 
 # ----------------------
 # DB PATH 설정
@@ -307,6 +310,26 @@ def patch_meal_item_time_taken():
             ))
             print("[DB PATCH] Added time_taken to meal_items")
 
+class Memory(Base):
+    __tablename__ = "memory"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, index=True)
+    memory_type = Column(String, index=True)  # "short", "mid", "long"
+    content = Column(Text)  # JSON 문자열
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    def get_json(self):
+        if not self.content:
+            return None
+        try:
+            return json.loads(self.content)
+        except:
+            return None
+
+    def set_json(self, data: dict):
+        self.content = json.dumps(data, ensure_ascii=False)
 
 # ----------------------
 # init_db()
@@ -345,7 +368,8 @@ def init_db():
     
     if not inspector.has_table("daily_nutrition_goals"):
         DailyNutritionGoal.__table__.create(bind=engine)
-
+    if not inspector.has_table("memory"):
+        Memory.__table__.create(bind=engine)
     # MealItem time_taken 패치 호출
     patch_meal_item_time_taken()
     # ===========================
