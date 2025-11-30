@@ -13,18 +13,24 @@ from src.services.nutrition import (
 )
 from src.schemas import ManualGoalRequest
 from src.schemas import (
+    MealCreateRequest,
+    MealItemInput,
     MealNameUpdateRequest,
     MealDateUpdateRequest,
     MealTimeUpdateRequest,
 )
+
+
 
 import os
 import json
 import re
 import requests
 from dotenv import load_dotenv
-from datetime import datetime,date
+from datetime import datetime,date,timedelta
 from typing import List,  Optional
+
+
 # 맨 위에 추가
 from src.services.summary import recompute_daily_summaries
 import hashlib
@@ -49,7 +55,11 @@ def ko(name_en: str) -> str:
         return name_en
 
 
-
+# -------------------------
+# Helper: Week Start (Monday)
+# -------------------------
+def get_week_start(d: date) -> date:
+    return d - timedelta(days=d.weekday())  # Monday = 0
 
 
 load_dotenv()
@@ -168,6 +178,7 @@ async def upload_food(file: UploadFile = File(...), session: Session = Depends(g
         return {
             "ai_result": [
               {
+                "food_id": f.id,
                 "name_en": f.name,
                 "name_ko": ko(f.name),
                 "calories": f.calories,
@@ -364,6 +375,7 @@ async def upload_food(file: UploadFile = File(...), session: Session = Depends(g
     return {
     "ai_result": [
         {
+            "food_id": f.id,
             "name": f.name,
             "name_ko": ko(f.name),
             "calories": f.calories,
@@ -378,6 +390,73 @@ async def upload_food(file: UploadFile = File(...), session: Session = Depends(g
         for f in saved_foods
     ]
 }
+
+@router.post("/meal/create_full", response_model=dict)
+def create_full_meal(
+    req: MealCreateRequest,
+    session: Session = Depends(get_db)
+):
+    # 날짜 변환
+    try:
+        meal_date = datetime.strptime(req.date, "%Y-%m-%d").date()
+    except:
+        raise HTTPException(status_code=400, detail="Invalid date format (YYYY-MM-DD)")
+
+    # ⭕ 1) MealLog 생성 (add_food_to_meal과 동일한 구조)
+    meal = db.MealLog(
+        user_id=req.user_id,
+        date=meal_date,
+        meal_name=req.meal_name,
+        time_taken=req.time_taken
+    )
+    session.add(meal)
+    session.commit()
+    session.refresh(meal)
+
+    created_items = []
+
+    # ⭕ 2) items 반복 → MealItem 여러 개 생성
+    for item in req.items:
+        food = session.query(db.Food).get(item.food_id)
+        if not food:
+            raise HTTPException(404, f"Food ID {item.food_id} not found")
+
+        meal_item = db.MealItem(
+            meal_id=meal.id,
+            food_id=item.food_id,
+            quantity_g=item.quantity_g
+        )
+        session.add(meal_item)
+        session.commit()
+        session.refresh(meal_item)
+
+        # add_food_to_meal과 동일한 ratio 방식
+        base_weight = food.weight or 100.0
+        ratio = item.quantity_g / base_weight
+
+        created_items.append({
+            "meal_item_id": meal_item.id,
+            "food_id": item.food_id,
+            "food_name": food.name,
+            "quantity_g": item.quantity_g,
+            "calories": food.calories * ratio,
+            "carbs": food.carbs * ratio,
+            "protein": food.protein * ratio,
+            "fat": food.fat * ratio,
+        })
+
+    # ⭕ 3) 요약 재계산 (add_food_to_meal과 동일)
+    recompute_daily_summaries(req.user_id, meal.date, session)
+
+    # 응답 형식도 기존 get_meals 구조와 맞춘다
+    return {
+        "meal_id": meal.id,
+        "date": req.date,
+        "meal_name": req.meal_name,
+        "time_taken": req.time_taken,
+        "items": created_items
+    }
+
 
 
 # ----------------------
@@ -855,24 +934,20 @@ def delete_meal(
 
 @router.get("/daily_goal", response_model=dict)
 def get_daily_goal(user_id: str, session: Session = Depends(get_db)):
-    
+
     user = session.query(db.User).get(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # 1) BMR 계산: 체지방이 있으면 Katch-McArdle, 없으면 Harris-Benedict
+    # --- 1) TDEE 계산 ---
     if user.body_fat is not None:
         bmr = calculate_bmr_katch_mcardle(user.weight, user.body_fat)
     else:
         bmr = calculate_bmr_harris_benedict(user.weight, user.height, user.age, user.sex)
 
-    # 2) TDEE = BMR * 활동레벨
     tdee = calculate_tdee(bmr, user.activity_level)
-
-    # 3) 목표 칼로리 (bulk / diet / lean / etc)
     target_calorie = calculate_goal_calories(tdee, user.goal)
 
-    # 4) 목표 단백질/지방/탄수 계산
     protein_g, fat_g, carbs_g = calculate_macros(
         weight=user.weight,
         goal_calories=target_calorie,
@@ -880,142 +955,146 @@ def get_daily_goal(user_id: str, session: Session = Depends(get_db)):
         skeletal_muscle=user.skeletal_muscle
     )
 
+    # --- 이번주 7일 날짜 구하기 ---
     today = date.today()
+    week_start = get_week_start(today)
+    days = [week_start + timedelta(days=i) for i in range(7)]
 
-    # 5) DB 저장 (있으면 업데이트, 없으면 생성)
-    existing = (
-        session.query(db.DailyNutritionGoal)
-        .filter_by(user_id=user_id, date=today)
-        .first()
-    )
-
-    if existing:
-        existing.target_calorie = target_calorie
-        existing.target_protein = protein_g
-        existing.target_fat = fat_g
-        existing.target_carb = carbs_g
-        existing.updated_at = datetime.utcnow()
-    else:
-        new_goal = db.DailyNutritionGoal(
-            user_id=user_id,
-            date=today,
-            target_calorie=target_calorie,
-            target_protein=protein_g,
-            target_fat=fat_g,
-            target_carb=carbs_g,
+    # --- 이번주 7일 모두 자동 목표로 저장 ---
+    for d in days:
+        existing = (
+            session.query(db.DailyNutritionGoal)
+            .filter_by(user_id=user_id, date=d)
+            .first()
         )
-        session.add(new_goal)
+
+        if existing:
+            existing.target_calorie = target_calorie
+            existing.target_protein = protein_g
+            existing.target_fat = fat_g
+            existing.target_carb = carbs_g
+            existing.is_manual = False
+            existing.updated_at = datetime.utcnow()
+        else:
+            session.add(
+                db.DailyNutritionGoal(
+                    user_id=user_id,
+                    date=d,
+                    target_calorie=target_calorie,
+                    target_protein=protein_g,
+                    target_fat=fat_g,
+                    target_carb=carbs_g,
+                    is_manual=False
+                )
+            )
 
     session.commit()
 
     return {
-        "tdee": round(tdee, 1),
+        "week_start": str(week_start),
+        "dates": [str(d) for d in days],
         "target_calorie": round(target_calorie, 1),
         "protein_g": round(protein_g, 1),
         "fat_g": round(fat_g, 1),
         "carbs_g": round(carbs_g, 1),
     }
 
-@router.post("/nutrition-goal/manual-calorie")
-def set_manual_calorie(
-    req: ManualGoalRequest,
-    session: Session = Depends(get_db)
-):
-    user_id = req.user_id
-    target_calorie = req.target_calorie
-    date_obj = (
-        datetime.strptime(req.date, "%Y-%m-%d").date()
-        if req.date else date.today()
-    )
 
-    user = session.query(db.User).get(user_id)
+
+
+
+@router.post("/nutrition-goal/manual-calorie")
+def set_manual_calorie(req: ManualGoalRequest, session: Session = Depends(get_db)):
+
+    user = session.query(db.User).get(req.user_id)
     if not user:
         raise HTTPException(404, "User not found")
 
+    today = date.today()
+    week_start = get_week_start(today)
+    days = [week_start + timedelta(days=i) for i in range(7)]
+
     protein_g, fat_g, carbs_g = calculate_macros(
-        user.weight,
-        target_calorie,
-        user.goal,
-        user.skeletal_muscle
+        weight=user.weight,
+        goal_calories=req.target_calorie,
+        goal=user.goal,
+        skeletal_muscle=user.skeletal_muscle
     )
 
-    existing = (
-        session.query(db.DailyNutritionGoal)
-        .filter_by(user_id=user_id, date=date_obj)
-        .first()
-    )
-
-    if existing:
-        existing.target_calorie = target_calorie
-        existing.target_protein = protein_g
-        existing.target_fat = fat_g
-        existing.target_carb = carbs_g
-        existing.updated_at = datetime.utcnow()
-    else:
-        session.add(
-            db.DailyNutritionGoal(
-                user_id=user_id,
-                date=date_obj,
-                target_calorie=target_calorie,
-                target_protein=protein_g,
-                target_fat=fat_g,
-                target_carb=carbs_g,
-            )
+    # --- 이번주 7일을 모두 수동 목표로 덮어쓰기 ---
+    for d in days:
+        existing = (
+            session.query(db.DailyNutritionGoal)
+            .filter_by(user_id=req.user_id, date=d)
+            .first()
         )
+
+        if existing:
+            existing.target_calorie = req.target_calorie
+            existing.target_protein = protein_g
+            existing.target_fat = fat_g
+            existing.target_carb = carbs_g
+            existing.is_manual = True
+            existing.updated_at = datetime.utcnow()
+        else:
+            session.add(
+                db.DailyNutritionGoal(
+                    user_id=req.user_id,
+                    date=d,
+                    target_calorie=req.target_calorie,
+                    target_protein=protein_g,
+                    target_fat=fat_g,
+                    target_carb=carbs_g,
+                    is_manual=True
+                )
+            )
 
     session.commit()
 
     return {
-        "date": str(date_obj),
-        "target_calorie": target_calorie,
+        "week_start": str(week_start),
+        "dates": [str(d) for d in days],
+        "target_calorie": req.target_calorie,
         "protein_g": protein_g,
         "fat_g": fat_g,
         "carbs_g": carbs_g
     }
 
+
+
+
 @router.get("/nutrition-goal/get", response_model=dict)
-def get_saved_nutrition_goal(
+def get_nutrition_goal(
     user_id: str,
-    date_str: str | None = None,
     session: Session = Depends(get_db)
 ):
-    """
-    🔎 저장된 DailyNutritionGoal 조회 전용 API
-    - 자동 계산 실행하지 않음
-    - DB 값만 반환
-    - 값이 없으면 not found 반환 또는 빈 값 반환 가능
-    """
+    today = date.today()
 
-    # 조회 날짜 설정
-    target_date = (
-        datetime.strptime(date_str, "%Y-%m-%d").date()
-        if date_str else date.today()
-    )
-
-    # DB 조회
     goal = (
         session.query(db.DailyNutritionGoal)
-        .filter_by(user_id=user_id, date=target_date)
+        .filter_by(user_id=user_id, date=today)
         .first()
     )
 
     if not goal:
         return {
             "user_id": user_id,
-            "date": str(target_date),
             "exists": False,
-            "message": "No nutrition goal saved for this date."
+            "message": "No nutrition goal saved for today."
         }
 
     return {
         "user_id": user_id,
-        "date": str(target_date),
         "exists": True,
+        "date": str(today),
         "target_calorie": round(goal.target_calorie, 1),
         "protein_g": round(goal.target_protein, 1),
         "fat_g": round(goal.target_fat, 1),
         "carbs_g": round(goal.target_carb, 1),
+        "is_manual": goal.is_manual
     }
+
+
 
 
 @router.put("/meal/update_name", response_model=dict)

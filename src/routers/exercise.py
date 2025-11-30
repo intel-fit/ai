@@ -6,6 +6,7 @@ from src.schemas import ExerciseLogCreate, ExerciseLogOut
 # 맨 위에 추가
 from datetime import date as _date
 from src.services.summary import recompute_daily_summaries
+from src.services.nutrition import update_daily_goal_after_exercise
 
 
 
@@ -33,6 +34,10 @@ def create_exercise_log(log: ExerciseLogCreate, session: Session = Depends(get_d
     # ✅ 요약 재계산 훅
     recompute_daily_summaries(log.user_id, log.date, session)
 
+    # 🔥 운동 후 자동 목표칼로리 갱신 추가
+    user = session.query(db.User).get(log.user_id)
+    update_daily_goal_after_exercise(user, log.date, session)
+
     return db_log
 
 
@@ -47,3 +52,5 @@ def create_exercise_log(log: ExerciseLogCreate, session: Session = Depends(get_d
     session.commit()
     session.refresh(db_log)
     return db_log
+
+

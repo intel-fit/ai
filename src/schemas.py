@@ -208,7 +208,6 @@ class ManualCalorieInput(BaseModel):
 class ManualGoalRequest(BaseModel):
     user_id: str
     target_calorie: float
-    date: str | None = None
 
 class MealNameUpdateRequest(BaseModel):
     meal_id: int
@@ -224,3 +223,20 @@ class MealTimeUpdateRequest(BaseModel):
     meal_id: int
     user_id: str
     time_taken: str   # HH:MM
+
+
+class MealItemInput(BaseModel):
+    food_id: int
+    food_name: Optional[str] = None
+    quantity_g: float
+    calories: float
+    carbs: float
+    protein: float
+    fat: float
+
+class MealCreateRequest(BaseModel):
+    user_id: str
+    date: str
+    meal_name: str
+    time_taken: Optional[str] = None
+    items: List[MealItemInput]

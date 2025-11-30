@@ -3,6 +3,14 @@ from datetime import datetime, timedelta, date
 from dateutil.relativedelta import relativedelta
 from src.services.ml_predictor import predict_next_week_activity, predict_goal_calories_ml
 import numpy as np
+from src import db
+
+def get_db():
+    session = db.SessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
 
 def calculate_bmr_katch_mcardle(weight: float, body_fat: float) -> float:
     """
@@ -329,3 +337,57 @@ def get_monthly_trend(user):
         })
 
     return list(reversed(trends))
+
+def update_daily_goal_after_exercise(user, target_date, session):
+    """운동 로그가 추가되면 자동 목표치만 업데이트 (manual은 건드리지 않음)"""
+
+    # 1) DailyNutritionGoal 조회
+    g = (
+        session.query(db.DailyNutritionGoal)
+        .filter_by(user_id=user.id, date=target_date)
+        .first()
+    )
+
+    # 없으면 만들 필요 없음 (다음에 daily_goal 호출하면 생성됨)
+    if not g:
+        return
+
+    # 2) 수동 설정이면 절대 갱신 금지
+    if g.is_manual:
+        return
+
+    # 3) TDEE 다시 계산
+    # BMR
+    if user.body_fat:
+        bmr = calculate_bmr_katch_mcardle(user.weight, user.body_fat)
+    else:
+        bmr = calculate_bmr_harris_benedict(user.weight, user.height, user.age, user.sex)
+
+    # 운동 요약 가져오기
+    ex = (
+        session.query(db.DailyExerciseSummary)
+        .filter_by(user_id=user.id, date=target_date)
+        .first()
+    )
+
+    burned = ex.calories_burned if ex else 0
+
+    # 새로운 TDEE = BMR * 활동계수 + 운동칼로리
+    new_tdee = bmr * user.activity_level + burned
+
+    # 목표 칼로리 적용
+    new_target_cal = calculate_goal_calories(new_tdee, user.goal)
+
+    # 매크로 다시 계산
+    protein_g, fat_g, carbs_g = calculate_macros(
+        user.weight, new_target_cal, user.goal, user.skeletal_muscle
+    )
+
+    # 4) DB 업데이트
+    g.target_calorie = new_target_cal
+    g.target_protein = protein_g
+    g.target_fat = fat_g
+    g.target_carb = carbs_g
+    g.updated_at = datetime.utcnow()
+
+    session.commit()

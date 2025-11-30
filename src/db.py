@@ -285,19 +285,24 @@ class DailyNutritionGoal(Base):
 
     id = Column(Integer, primary_key=True)
     user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
-    date = Column(Date, nullable=False, index=True)
+
+    date = Column(Date, nullable=False, index=True)   # ← 요게 핵심
+    # week_start_date 삭제해야 한다
 
     target_calorie = Column(Float, default=0)
     target_protein = Column(Float, default=0)
     target_fat = Column(Float, default=0)
     target_carb = Column(Float, default=0)
 
+    is_manual = Column(Boolean, default=False)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     __table_args__ = (
-        UniqueConstraint("user_id", "date", name="_user_date_goal_uc"),
+        UniqueConstraint("user_id", "date", name="_user_daily_goal_unique_"),
     )
+
 
 def patch_meal_item_time_taken():
     inspector = inspect(engine)
@@ -330,6 +335,39 @@ class Memory(Base):
 
     def set_json(self, data: dict):
         self.content = json.dumps(data, ensure_ascii=False)
+
+
+def patch_daily_nutrition_goals_table():
+    inspector = inspect(engine)
+    columns = [col['name'] for col in inspector.get_columns("daily_nutrition_goals")]
+
+    alter_statements = []
+
+    # 새 구조에 필요한 컬럼 추가
+    if "date" not in columns:
+        alter_statements.append(
+            "ALTER TABLE daily_nutrition_goals ADD COLUMN date DATE"
+        )
+
+    if "is_manual" not in columns:
+        alter_statements.append(
+            "ALTER TABLE daily_nutrition_goals ADD COLUMN is_manual BOOLEAN DEFAULT 0"
+        )
+
+    # 옛날 컬럼이 남아있으면 제거할 수 없음 → 그냥 무시
+    # (SQLite DROP COLUMN 미지원)
+    if "week_start_date" in columns:
+        print("[DB PATCH WARNING] 'week_start_date' column still exists (SQLite cannot drop columns).")
+
+    # ALTER 실행
+    with engine.connect() as conn:
+        for sql in alter_statements:
+            try:
+                conn.execute(text(sql))
+                print(f"[DB PATCH] Executed: {sql}")
+            except Exception as e:
+                print(f"[DB PATCH ERROR] {sql} → {e}")
+
 
 # ----------------------
 # init_db()
@@ -370,33 +408,41 @@ def init_db():
         DailyNutritionGoal.__table__.create(bind=engine)
     if not inspector.has_table("memory"):
         Memory.__table__.create(bind=engine)
+    # daily_nutrition_goals 패치
+    if inspector.has_table("daily_nutrition_goals"):
+        patch_daily_nutrition_goals_table()
+
     # MealItem time_taken 패치 호출
     patch_meal_item_time_taken()
-    # ===========================
-    # PATCH — Add Subscription Columns if Missing
-    # ===========================
-    def patch_subscription_table():
-        inspector_local = inspect(engine)
-        columns = [col['name'] for col in inspector_local.get_columns("subscriptions")]
+    
 
-        alter_statements = []
+# ===========================
+# PATCH — Add Subscription Columns if Missing
+# ===========================
+def patch_subscription_table():
+    inspector_local = inspect(engine)
+    columns = [col['name'] for col in inspector_local.get_columns("subscriptions")]
 
-        if "renewal_reminder_sent" not in columns:
-            alter_statements.append(
-                "ALTER TABLE subscriptions ADD COLUMN renewal_reminder_sent BOOLEAN DEFAULT 0"
-            )
+    alter_statements = []
 
-        if "expire_reminder_sent" not in columns:
-            alter_statements.append(
-                "ALTER TABLE subscriptions ADD COLUMN expire_reminder_sent BOOLEAN DEFAULT 0"
-            )
+    if "renewal_reminder_sent" not in columns:
+        alter_statements.append(
+            "ALTER TABLE subscriptions ADD COLUMN renewal_reminder_sent BOOLEAN DEFAULT 0"
+        )
 
-        # 실제 ALTER 실행
-        with engine.connect() as conn:
-            for sql in alter_statements:
-                try:
-                    conn.execute(text(sql))   # ← text()로 감싸기
-                    print(f"[DB PATCH] Executed: {sql}")
-                except Exception as e:
-                    print(f"[DB PATCH ERROR] {sql} → {e}")
+    if "expire_reminder_sent" not in columns:
+        alter_statements.append(
+            "ALTER TABLE subscriptions ADD COLUMN expire_reminder_sent BOOLEAN DEFAULT 0"
+        )
+
+    # 실제 ALTER 실행
+    with engine.connect() as conn:
+        for sql in alter_statements:
+            try:
+                conn.execute(text(sql))   # ← text()로 감싸기
+                print(f"[DB PATCH] Executed: {sql}")
+            except Exception as e:
+                print(f"[DB PATCH ERROR] {sql} → {e}")
+
+
 
