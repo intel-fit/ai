@@ -7,8 +7,11 @@ from src.services import nutrition
 from src.services.ai_meal_generator_gemini import generate_realistic_meal_plan
 import json
 import random
+from src.services.personal_meal_scoring import get_ranked_food_candidates  # ✅ 추가
+from src.services.meal_history_writer import save_ai_meal_plan_to_history
 
 router = APIRouter(tags=["Meal Recommendation"])
+
 
 # ----------------------------------------------------------
 # DB 연결
@@ -34,10 +37,11 @@ def recommend_daily_meal(
     session: Session = Depends(get_db)
 ):
     """
-    현실적인 AI 식단 추천 (Gemini 기반)
+    현실적인 AI 식단 추천 (Gemini 기반 + 개인화 점수 엔진)
     - 기존 recommend_daily_meal 구조 유지
     - 일일 / 주간 식단 모두 지원
-    - 선호/비선호 음식 자동 반영
+    - 선호/비선호 음식 + 새 preference/exclusion 테이블 반영
+    - personal_meal_scoring 기반 상위 후보 음식 리스트 전달
     """
 
     # 1️⃣ 사용자 조회
@@ -59,9 +63,11 @@ def recommend_daily_meal(
         user.weight, target_kcal, goal, getattr(user, "skeletal_muscle", None)
     )
 
-    # 3️⃣ 선호 / 비선호 음식 로드
-    preferred_foods, disliked_foods = [], []
+    # 3️⃣ 선호 / 비선호 음식 로드 (기존 user 컬럼 + 새 테이블 모두 사용)
+    preferred_foods: list[str] = []
+    disliked_foods: list[str] = []
 
+    # (1) 옛날 방식: user.preferred_foods / user.excluded_foods 가 있다면 반영
     if hasattr(user, "preferred_foods") and user.preferred_foods:
         if isinstance(user.preferred_foods, str):
             try:
@@ -80,7 +86,26 @@ def recommend_daily_meal(
         elif isinstance(user.excluded_foods, list):
             disliked_foods = user.excluded_foods
 
-    # 프론트 입력(제외 음식) 반영
+    # (2) 새 테이블 기반: UserFoodPreference / UserFoodExclusion 반영
+    pref_rows = (
+        session.query(db.UserFoodPreference)
+        .filter_by(user_id=user_id)
+        .all()
+    )
+    for row in pref_rows:
+        if row.food_name not in preferred_foods and row.score > 0:
+            preferred_foods.append(row.food_name)
+
+    excl_rows = (
+        session.query(db.UserFoodExclusion)
+        .filter_by(user_id=user_id)
+        .all()
+    )
+    for row in excl_rows:
+        if row.food_name not in disliked_foods:
+            disliked_foods.append(row.food_name)
+
+    # (3) 프론트 입력(이번 요청에서 제외하고 싶은 음식)도 합치기
     if excluded_foods:
         disliked_foods = list(set(disliked_foods + excluded_foods))
 
@@ -100,7 +125,35 @@ def recommend_daily_meal(
 
     custom_comment = f"🍽️ {comment_line}\n아래는 {'일일' if period=='daily' else '주간'} 식단 추천입니다."
 
-    # 5️⃣ Gemini 기반 식단 생성
+    # 5️⃣ 개인화 점수 엔진으로 상위 음식 후보 생성
+    try:
+        ranked = get_ranked_food_candidates(
+            session=session,
+            user_id=user_id,
+            limit=80,        # 상위 80개 정도 후보
+            recent_days=7,   # 최근 7일 식단을 기준으로 novelty 반영
+        )
+        candidate_foods = []
+        for food, score in ranked:
+            candidate_foods.append({
+                "name": food.name,
+                "company": food.company,
+                "calories": food.calories,
+                "protein": food.protein,
+                "fat": food.fat,
+                "carbs": food.carbs,
+                "fiber": food.fiber,
+                "sugar": food.sugar,
+                "sodium": food.sodium,
+                "weight": food.weight,
+                "processing_level": food.processing_level,
+                "score": score,
+            })
+    except Exception as e:
+        # 점수 엔진이 실패하더라도 전체 기능이 죽지 않도록 fallback
+        candidate_foods = None
+
+    # 6️⃣ Gemini 기반 식단 생성 (개인화 후보 리스트 전달)
     ai_plan = generate_realistic_meal_plan(
         user=user,
         tdee=target_kcal,
@@ -108,9 +161,10 @@ def recommend_daily_meal(
         meals_per_day=meals_per_day,
         preferred_foods=preferred_foods,
         excluded_foods=disliked_foods,
+        candidate_foods=candidate_foods,   # ✅ 새로 추가된 인자
     )
 
-    # 6️⃣ 주간 모드 지원
+    # 7️⃣ 주간 모드 지원
     if period == "weekly":
         ai_plan["request_type"] = "weekly"
         ai_plan["days"] = [
@@ -120,7 +174,7 @@ def recommend_daily_meal(
             }
             for i in range(7)
         ]
-        # 중복 최소화 처리
+        # 중복 최소화 처리 (기존 로직 그대로 유지)
         all_foods = []
         for d in ai_plan["days"]:
             for meal in d["meals"]:
@@ -134,7 +188,19 @@ def recommend_daily_meal(
                     if unique_foods:
                         f["name"] = unique_foods[(i + hash(f["name"])) % len(unique_foods)]
 
-    # 7️⃣ 프론트 호환형 반환 구조
+    # 🔥 7️⃣ 추천 결과를 DB(UserMealHistory)에 자동 저장
+    try:
+        saved_ids = save_ai_meal_plan_to_history(
+            session=session,
+            user_id=user_id,
+            ai_plan=ai_plan,
+        )
+        print(f"[MealHistory] saved entries: {saved_ids}")
+
+    except Exception as e:
+        print(f"[MealHistory ERROR] {e}")
+
+    # 8️⃣ 프론트 호환형 반환 구조
     return {
         "date": datetime.now().strftime("%Y-%m-%d"),
         "user_id": user_id,
@@ -145,5 +211,27 @@ def recommend_daily_meal(
         "target_fat": round(fat_target, 1),
         "target_carbs": round(carbs_target, 1),
         "comment": custom_comment.strip(),
-        "ai_meal_plan": ai_plan,     # ✅ AI 식단 전체 구조 추가 (기존 meals 대체)
+        "ai_meal_plan": ai_plan,
     }
+
+
+def get_meal_kcal_distribution(meals_per_day: int) -> list[float]:
+    """
+    끼니 수에 따라 총칼로리를 어떤 비율로 나눌지 반환한다.
+    반환: 각 끼니의 분배 비율 리스트 (합 = 1.0)
+    """
+
+    if meals_per_day == 2:
+        return [0.45, 0.55]
+
+    if meals_per_day == 3:
+        return [0.30, 0.40, 0.30]
+
+    if meals_per_day == 4:
+        return [0.25, 0.30, 0.25, 0.20]
+
+    if meals_per_day == 5:
+        return [0.20, 0.25, 0.25, 0.20, 0.10]
+
+    # 6끼 이상? → 균등 분배
+    return [1.0 / meals_per_day] * meals_per_day

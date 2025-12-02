@@ -18,6 +18,17 @@ from src.routers import exercise_feedback
 from src.routers.home_feedback import router as home_feedback_router
 from src.routers import home 
 from src.routers import stripe
+from src.routers import profile, preferences, exclusions, meal_history
+
+
+from src.routers import meal_feedback  # 상단 import에 추가
+
+from src.tasks.scheduler import start_scheduler
+
+
+
+
+
 
 
 
@@ -50,11 +61,17 @@ app = FastAPI(title="Diet AI API")
 # DB 초기화
 init_db()
 
+@app.on_event("startup")
+def launch_tasks():
+    start_scheduler()
+
 # 라우터 등록
 app.include_router(food.router, prefix="/food")
 app.include_router(user.router, prefix="/user")
 app.include_router(exercise.router, prefix="/exercise")
 app.include_router(recommendation.router, prefix="/recommend")
+
+
 app.include_router(test_data.router, prefix="/test") #테스트용
 app.include_router(meal_plan_ai.router, prefix="/ai-plan")
 app.include_router(feedback_router.router)
@@ -69,6 +86,15 @@ app.include_router(exercise_feedback.router)
 app.include_router(home_feedback_router)
 app.include_router(home.router) 
 app.include_router(stripe.router, prefix="/stripe", tags=["Stripe"])
+
+
+app.include_router(profile.router)
+app.include_router(preferences.router)
+app.include_router(exclusions.router)
+app.include_router(meal_history.router)
+app.include_router(meal_feedback.router)  # 다른 include_router 들 아래쪽에 추가
+
+
 
 
 if __name__ == "__main__":

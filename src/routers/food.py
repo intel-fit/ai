@@ -9,7 +9,8 @@ from src.services.nutrition import (
     calculate_bmr_harris_benedict,
     calculate_tdee,
     calculate_goal_calories,
-    calculate_macros
+    calculate_macros,
+    calculate_macros_from_manual_goal
 )
 from src.schemas import ManualGoalRequest
 from src.schemas import (
@@ -932,18 +933,38 @@ def delete_meal(
     return {"status": "deleted", "meal_id": meal_id}
 
 
-@router.get("/daily_goal", response_model=dict)
-def get_daily_goal(user_id: str, session: Session = Depends(get_db)):
+@router.get(
+    "/daily_goal",
+    response_model=dict,
+    summary="특정 날짜에 자동 영양 목표(TDEE 기반)를 저장",
+    description="""
+    사용자의 TDEE를 계산해 **지정한 날짜 1일치 자동 목표 칼로리/영양소를 저장**합니다.
 
+    - 기존 기록이 있어도 자동 목표는 항상 덮어씁니다.
+    - is_manual = False 로 설정됩니다.
+    - 날짜는 YYYY-MM-DD 형식으로 전달해야 합니다.
+    """
+)
+def get_daily_goal(
+    user_id: str,
+    date: str,
+    session: Session = Depends(get_db)
+):
+    # date 파싱
+    target_date = datetime.strptime(date, "%Y-%m-%d").date()
+
+    # 사용자 조회
     user = session.query(db.User).get(user_id)
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(404, "User not found")
 
     # --- 1) TDEE 계산 ---
     if user.body_fat is not None:
         bmr = calculate_bmr_katch_mcardle(user.weight, user.body_fat)
     else:
-        bmr = calculate_bmr_harris_benedict(user.weight, user.height, user.age, user.sex)
+        bmr = calculate_bmr_harris_benedict(
+            user.weight, user.height, user.age, user.sex
+        )
 
     tdee = calculate_tdee(bmr, user.activity_level)
     target_calorie = calculate_goal_calories(tdee, user.goal)
@@ -955,44 +976,38 @@ def get_daily_goal(user_id: str, session: Session = Depends(get_db)):
         skeletal_muscle=user.skeletal_muscle
     )
 
-    # --- 이번주 7일 날짜 구하기 ---
-    today = date.today()
-    week_start = get_week_start(today)
-    days = [week_start + timedelta(days=i) for i in range(7)]
+    # --- 2) 해당 날짜만 저장 ---
+    existing = (
+        session.query(db.DailyNutritionGoal)
+        .filter_by(user_id=user_id, date=target_date)
+        .first()
+    )
 
-    # --- 이번주 7일 모두 자동 목표로 저장 ---
-    for d in days:
-        existing = (
-            session.query(db.DailyNutritionGoal)
-            .filter_by(user_id=user_id, date=d)
-            .first()
-        )
-
-        if existing:
-            existing.target_calorie = target_calorie
-            existing.target_protein = protein_g
-            existing.target_fat = fat_g
-            existing.target_carb = carbs_g
-            existing.is_manual = False
-            existing.updated_at = datetime.utcnow()
-        else:
-            session.add(
-                db.DailyNutritionGoal(
-                    user_id=user_id,
-                    date=d,
-                    target_calorie=target_calorie,
-                    target_protein=protein_g,
-                    target_fat=fat_g,
-                    target_carb=carbs_g,
-                    is_manual=False
-                )
+    if existing:
+        # 자동 목표는 무조건 overwrite
+        existing.target_calorie = target_calorie
+        existing.target_protein = protein_g
+        existing.target_fat = fat_g
+        existing.target_carb = carbs_g
+        existing.is_manual = False
+        existing.updated_at = datetime.utcnow()
+    else:
+        session.add(
+            db.DailyNutritionGoal(
+                user_id=user_id,
+                date=target_date,
+                target_calorie=target_calorie,
+                target_protein=protein_g,
+                target_fat=fat_g,
+                target_carb=carbs_g,
+                is_manual=False
             )
+        )
 
     session.commit()
 
     return {
-        "week_start": str(week_start),
-        "dates": [str(d) for d in days],
+        "date": str(target_date),
         "target_calorie": round(target_calorie, 1),
         "protein_g": round(protein_g, 1),
         "fat_g": round(fat_g, 1),
@@ -1002,26 +1017,52 @@ def get_daily_goal(user_id: str, session: Session = Depends(get_db)):
 
 
 
+@router.post(
+    "/nutrition-goal/manual-calorie",
+    summary="지정 날짜부터 말일까지 '수동 영양 목표'를 일괄 적용",
+    description="""
+    사용자가 하루 목표 칼로리를 직접 입력하면  
+    **해당 날짜부터 그 달의 말일까지 모든 날짜를 수동 설정(is_manual=True)으로 갱신합니다.**
 
-@router.post("/nutrition-goal/manual-calorie")
-def set_manual_calorie(req: ManualGoalRequest, session: Session = Depends(get_db)):
-
+    - 기존 자동/수동 기록 모두 덮어쓰기됨
+    - date 필드를 지정해야 함 (YYYY-MM-DD)
+    - 이후 Exercise Log에 의해 자동 업데이트되지 않음
+    """
+)
+def set_manual_calorie(
+    req: ManualGoalRequest,
+    session: Session = Depends(get_db)
+):
     user = session.query(db.User).get(req.user_id)
     if not user:
         raise HTTPException(404, "User not found")
 
-    today = date.today()
-    week_start = get_week_start(today)
-    days = [week_start + timedelta(days=i) for i in range(7)]
+    # 🔥 요청받은 날짜 사용
+    try:
+        start_date = datetime.strptime(req.date, "%Y-%m-%d").date()
+    except:
+        raise HTTPException(400, "Invalid date format (YYYY-MM-DD required)")
 
-    protein_g, fat_g, carbs_g = calculate_macros(
-        weight=user.weight,
-        goal_calories=req.target_calorie,
-        goal=user.goal,
-        skeletal_muscle=user.skeletal_muscle
+    # 🔥 말일 계산
+    end_of_month = (
+        start_date.replace(day=28) + timedelta(days=4)
+    ).replace(day=1) - timedelta(days=1)
+
+    # 🔥 날짜 범위 생성: start_date → 말일
+    days = [
+        start_date + timedelta(days=i)
+        for i in range((end_of_month - start_date).days + 1)
+    ]
+
+    # 매크로 계산
+    protein_g, fat_g, carbs_g = calculate_macros_from_manual_goal(
+        total_calorie=req.target_calorie,
+        goal=user.goal
     )
 
-    # --- 이번주 7일을 모두 수동 목표로 덮어쓰기 ---
+
+    updated_dates = []
+
     for d in days:
         existing = (
             session.query(db.DailyNutritionGoal)
@@ -1049,11 +1090,15 @@ def set_manual_calorie(req: ManualGoalRequest, session: Session = Depends(get_db
                 )
             )
 
+        updated_dates.append(str(d))
+
     session.commit()
 
     return {
-        "week_start": str(week_start),
-        "dates": [str(d) for d in days],
+        "applied_from": str(start_date),
+        "applied_until": str(end_of_month),
+        "count_days_updated": len(updated_dates),
+        "dates": updated_dates,
         "target_calorie": req.target_calorie,
         "protein_g": protein_g,
         "fat_g": fat_g,
@@ -1063,16 +1108,32 @@ def set_manual_calorie(req: ManualGoalRequest, session: Session = Depends(get_db
 
 
 
-@router.get("/nutrition-goal/get", response_model=dict)
+
+@router.get(
+    "/nutrition-goal/get",
+    response_model=dict,
+    summary="특정 날짜의 영양 목표 조회",
+    description="""
+    저장된 DailyNutritionGoal 중 요청한 날짜의 목표를 반환합니다.
+
+    - 자동/수동 여부(is_manual) 포함
+    - 존재하지 않는 경우 exists=False 반환
+    """
+)
 def get_nutrition_goal(
     user_id: str,
+    date: str,
     session: Session = Depends(get_db)
 ):
-    today = date.today()
+    # 문자열 → date 파싱
+    try:
+        target_date = datetime.strptime(date, "%Y-%m-%d").date()
+    except:
+        raise HTTPException(400, "Invalid date format. Use YYYY-MM-DD")
 
     goal = (
         session.query(db.DailyNutritionGoal)
-        .filter_by(user_id=user_id, date=today)
+        .filter_by(user_id=user_id, date=target_date)
         .first()
     )
 
@@ -1080,13 +1141,13 @@ def get_nutrition_goal(
         return {
             "user_id": user_id,
             "exists": False,
-            "message": "No nutrition goal saved for today."
+            "message": f"No nutrition goal saved for {target_date}"
         }
 
     return {
         "user_id": user_id,
         "exists": True,
-        "date": str(today),
+        "date": str(target_date),
         "target_calorie": round(goal.target_calorie, 1),
         "protein_g": round(goal.target_protein, 1),
         "fat_g": round(goal.target_fat, 1),
@@ -1094,6 +1155,166 @@ def get_nutrition_goal(
         "is_manual": goal.is_manual
     }
 
+@router.get(
+    "/daily_goal/month",
+    response_model=dict,
+    summary="지정 날짜부터 말일까지 자동 목표(TDEE 기반)를 일괄 생성",
+    description="""
+    사용자의 TDEE 기반 자동 목표를  
+    **요청한 날짜부터 해당 달의 말일까지 모두 생성/업데이트합니다.**
+
+    - manual 목표가 아닌 자동 목표(is_manual=False)
+    - 기존 기록이 있어도 덮어씁니다.
+    - Exercise log 변화에 따라 자동으로 조정됩니다.
+    """
+)
+def set_monthly_auto_goal(
+    user_id: str,
+    date: str,
+    session: Session = Depends(get_db)
+):
+    # 문자열 → 날짜
+    target_date = datetime.strptime(date, "%Y-%m-%d").date()
+
+    user = session.query(db.User).get(user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    # --- TDEE 계산 ---
+    if user.body_fat is not None:
+        bmr = calculate_bmr_katch_mcardle(user.weight, user.body_fat)
+    else:
+        bmr = calculate_bmr_harris_benedict(
+            user.weight, user.height, user.age, user.sex
+        )
+
+    tdee = calculate_tdee(bmr, user.activity_level)
+    target_cal = calculate_goal_calories(tdee, user.goal)
+
+    protein_g, fat_g, carbs_g = calculate_macros(
+        weight=user.weight,
+        goal_calories=target_cal,
+        goal=user.goal,
+        skeletal_muscle=user.skeletal_muscle
+    )
+
+    # --- 이번 달 계산 ---
+    first_day = target_date.replace(day=1)
+
+    # 말일 계산
+    end_of_month = (first_day.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+
+    # 🔥 핵심 수정: "해당 날짜부터 말일까지"만 갱신
+    start_day = target_date  
+    days = [start_day + timedelta(days=i) for i in range((end_of_month - start_day).days + 1)]
+
+    updated = []
+
+    for d in days:
+        goal = (
+            session.query(db.DailyNutritionGoal)
+            .filter_by(user_id=user_id, date=d)
+            .first()
+        )
+
+        if goal:
+            goal.target_calorie = target_cal
+            goal.target_protein = protein_g
+            goal.target_fat = fat_g
+            goal.target_carb = carbs_g
+            goal.is_manual = False  # 자동
+            goal.updated_at = datetime.utcnow()
+        else:
+            session.add(
+                db.DailyNutritionGoal(
+                    user_id=user_id,
+                    date=d,
+                    target_calorie=target_cal,
+                    target_protein=protein_g,
+                    target_fat=fat_g,
+                    target_carb=carbs_g,
+                    is_manual=False
+                )
+            )
+
+        updated.append(str(d))
+
+    session.commit()
+
+    return {
+        "applied_from": str(start_day),
+        "applied_until": str(end_of_month),
+        "dates_updated": updated,
+        "target_calorie": target_cal
+    }
+
+
+
+@router.post(
+    "/nutrition-goal/manual-calorie/day",
+    summary="특정 날짜 하루만 수동 목표 칼로리 설정",
+    description="""
+    사용자 요청으로 **특정 1일만 수동 설정된 목표 칼로리로 갱신**합니다.
+
+    - is_manual=True 로 저장됨
+    - 다른 날짜에는 영향 없음
+    - Exercise Log로 인해 자동 업데이트되지 않음
+    """
+)
+def set_manual_calorie_day(
+    req: ManualGoalRequest,
+    session: Session = Depends(get_db)
+):
+    user = session.query(db.User).get(req.user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    if not req.date:
+        raise HTTPException(400, "date is required in format YYYY-MM-DD")
+
+    # 날짜 파싱
+    target_date = datetime.strptime(req.date, "%Y-%m-%d").date()
+
+    # 매크로 계산
+    # 매크로 계산
+    protein_g, fat_g, carbs_g = calculate_macros_from_manual_goal(
+        total_calorie=req.target_calorie,
+        goal=user.goal
+    )
+
+    goal = (
+        session.query(db.DailyNutritionGoal)
+        .filter_by(user_id=req.user_id, date=target_date)
+        .first()
+    )
+
+    if goal:
+        goal.target_calorie = req.target_calorie
+        goal.target_protein = protein_g
+        goal.target_fat = fat_g
+        goal.target_carb = carbs_g
+        goal.is_manual = True
+        goal.updated_at = datetime.utcnow()
+    else:
+        session.add(
+            db.DailyNutritionGoal(
+                user_id=req.user_id,
+                date=target_date,
+                target_calorie=req.target_calorie,
+                target_protein=protein_g,
+                target_fat=fat_g,
+                target_carb=carbs_g,
+                is_manual=True
+            )
+        )
+
+    session.commit()
+
+    return {
+        "date": str(target_date),
+        "target_calorie": req.target_calorie,
+        "is_manual": True
+    }
 
 
 

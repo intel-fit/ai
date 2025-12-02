@@ -33,14 +33,27 @@ def calculate_tdee(bmr: float, activity_level: float) -> float:
     return bmr * activity_level
 
 def calculate_goal_calories(tdee: float, goal: str) -> float:
-    goal = goal.lower()
-    if goal == "diet":
-        return tdee * 0.8
-    elif goal == "bulk":
-        return tdee * 1.2
-    elif goal == "lean":
-        return tdee * 1.05
+    """
+    목표(goal)에 따라 TDEE 조정
+    DIET, BULK, LEAN_MASS, MUSCLE_GAIN, MAINTENANCE
+    """
+
+    goal = goal.upper()
+
+    if goal == "DIET":
+        return tdee * 0.80  # 감량
+    elif goal == "BULK":
+        return tdee * 1.20  # 벌크업
+    elif goal == "LEAN_MASS":
+        return tdee * 1.05  # 린매스업
+    elif goal == "MUSCLE_GAIN":
+        return tdee * 1.10  # 근증량
+    elif goal == "MAINTENANCE":
+        return tdee
+
+    # fallback
     return tdee
+
 
 # 목표 단백질 계산 (체중, 목표에 따라)
 def calculate_protein(user_weight: float, goal: str) -> float:
@@ -97,17 +110,17 @@ def adjust_activity_level(exercise_logs, reference_date: date):
         return 1.9
 
 def calculate_macros(weight, goal_calories, goal, skeletal_muscle=None):
-    """
-    목표에 따른 단백질/지방/탄수 계산
-    skeletal_muscle: kg 단위, Lean Mass 기반 단백질 계산 가능
-    """
-    # 단백질 g 계산
-    if goal == "bulk":
-        protein_per_kg = 2.2
-    elif goal == "diet":
-        protein_per_kg = 2.5
-    else:  # lean
-        protein_per_kg = 2.0
+    goal = goal.upper()
+
+    protein_factor_map = {
+        "DIET": 2.3,
+        "BULK": 2.0,
+        "LEAN_MASS": 2.1,
+        "MUSCLE_GAIN": 2.0,
+        "MAINTENANCE": 1.8,
+    }
+
+    protein_per_kg = protein_factor_map.get(goal, 1.8)
 
     if skeletal_muscle:
         protein_g = skeletal_muscle * protein_per_kg
@@ -115,29 +128,26 @@ def calculate_macros(weight, goal_calories, goal, skeletal_muscle=None):
         protein_g = weight * protein_per_kg
 
     protein_cal = protein_g * 4
-    
-    # 지방 g 계산
-    fat_g = (0.25 * goal_calories) / 9  # 총칼로리의 25%
+
+    fat_ratio_map = {
+        "DIET": 0.25,
+        "BULK": 0.25,
+        "LEAN_MASS": 0.20,
+        "MUSCLE_GAIN": 0.20,
+        "MAINTENANCE": 0.30,
+    }
+
+    fat_ratio = fat_ratio_map.get(goal, 0.25)
+
+    fat_g = (goal_calories * fat_ratio) / 9
     fat_cal = fat_g * 9
-    
-    # 탄수화물 g 계산
+
     carbs_cal = goal_calories - (protein_cal + fat_cal)
     carbs_g = carbs_cal / 4
-    
-    return protein_g, fat_g, carbs_g    
 
-def intensity_weight(intensity_level: int) -> float:
-    """
-    운동 강도 단계별 가중치
-    """
-    weights = {
-        1: 1.0,  # 매우 가벼움
-        2: 1.1,  # 가벼움
-        3: 1.25, # 중간
-        4: 1.4,  # 높음
-        5: 1.6,  # 매우 높음
-    }
-    return weights.get(intensity_level, 1.0)
+    return round(protein_g, 1), round(fat_g, 1), round(carbs_g, 1)
+
+
 
 
 
@@ -338,56 +348,84 @@ def get_monthly_trend(user):
 
     return list(reversed(trends))
 
-def update_daily_goal_after_exercise(user, target_date, session):
-    """운동 로그가 추가되면 자동 목표치만 업데이트 (manual은 건드리지 않음)"""
+def update_daily_goal_after_exercise(user_id: str, target_date: date, session):
+    """
+    운동 로그가 추가된 특정 날짜의 자동 목표만 다시 계산하여 업데이트.
+    수동 설정(is_manual=True)인 날짜는 절대 변경되지 않음.
+    """
 
-    # 1) DailyNutritionGoal 조회
-    g = (
+    # 1) user 조회
+    user = session.query(db.User).get(user_id)
+    if not user:
+        return
+
+    # 2) 날짜별 목표 조회
+    goal = (
         session.query(db.DailyNutritionGoal)
-        .filter_by(user_id=user.id, date=target_date)
+        .filter_by(user_id=user_id, date=target_date)
         .first()
     )
+    if not goal or goal.is_manual:
+        return  # 없거나 manual이면 종료
 
-    # 없으면 만들 필요 없음 (다음에 daily_goal 호출하면 생성됨)
-    if not g:
-        return
+    # 3) 최신 운동 요약 가져오기
+    daily_ex = (
+        session.query(db.DailyExerciseSummary)
+        .filter_by(user_id=user_id, date=target_date)
+        .first()
+    )
+    if daily_ex:
+        session.refresh(daily_ex)
 
-    # 2) 수동 설정이면 절대 갱신 금지
-    if g.is_manual:
-        return
+    burned = daily_ex.calories_burned if daily_ex else 0
 
-    # 3) TDEE 다시 계산
-    # BMR
-    if user.body_fat:
+    # 4) TDEE 새로 계산
+    if user.body_fat is not None:
         bmr = calculate_bmr_katch_mcardle(user.weight, user.body_fat)
     else:
         bmr = calculate_bmr_harris_benedict(user.weight, user.height, user.age, user.sex)
 
-    # 운동 요약 가져오기
-    ex = (
-        session.query(db.DailyExerciseSummary)
-        .filter_by(user_id=user.id, date=target_date)
-        .first()
-    )
+    new_tdee = calculate_tdee(bmr, user.activity_level) + burned
+    new_target_calorie = calculate_goal_calories(new_tdee, user.goal)
 
-    burned = ex.calories_burned if ex else 0
-
-    # 새로운 TDEE = BMR * 활동계수 + 운동칼로리
-    new_tdee = bmr * user.activity_level + burned
-
-    # 목표 칼로리 적용
-    new_target_cal = calculate_goal_calories(new_tdee, user.goal)
-
-    # 매크로 다시 계산
     protein_g, fat_g, carbs_g = calculate_macros(
-        user.weight, new_target_cal, user.goal, user.skeletal_muscle
+        weight=user.weight,
+        goal_calories=new_target_calorie,
+        goal=user.goal,
+        skeletal_muscle=user.skeletal_muscle
     )
 
-    # 4) DB 업데이트
-    g.target_calorie = new_target_cal
-    g.target_protein = protein_g
-    g.target_fat = fat_g
-    g.target_carb = carbs_g
-    g.updated_at = datetime.utcnow()
+    # 5) DB 업데이트
+    goal.target_calorie = new_target_calorie
+    goal.target_protein = protein_g
+    goal.target_fat = fat_g
+    goal.target_carb = carbs_g
+    goal.updated_at = datetime.utcnow()
 
+    session.flush()
     session.commit()
+
+
+def calculate_macros_from_manual_goal(total_calorie: float, goal: str):
+    """
+    사용자가 직접 입력한 칼로리(total_calorie)를 기반으로
+    목표(goal)에 따라 탄단지 비율을 나누어 g 단위로 반환.
+    """
+
+    goal = goal.upper()
+
+    ratio_map = {
+        "DIET":        (0.35, 0.20, 0.45),  # 단백질 높게, 지방 낮게
+        "BULK":        (0.28, 0.22, 0.50),  # 탄수 비중 높게
+        "LEAN_MASS":   (0.33, 0.22, 0.45),
+        "MUSCLE_GAIN": (0.30, 0.20, 0.50),
+        "MAINTENANCE": (0.30, 0.30, 0.40),
+    }
+
+    pct_p, pct_f, pct_c = ratio_map.get(goal, ratio_map["MAINTENANCE"])
+
+    protein_g = round((total_calorie * pct_p) / 4, 1)
+    fat_g     = round((total_calorie * pct_f) / 9, 1)
+    carbs_g   = round((total_calorie * pct_c) / 4, 1)
+
+    return protein_g, fat_g, carbs_g

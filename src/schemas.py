@@ -5,6 +5,8 @@ from typing import Optional
 from datetime import datetime
 
 
+
+
 # ----------------------
 # AI 운동 추천 관련 스키마
 # ----------------------
@@ -208,6 +210,7 @@ class ManualCalorieInput(BaseModel):
 class ManualGoalRequest(BaseModel):
     user_id: str
     target_calorie: float
+    date: Optional[str] = None   # ← 하루 manual에 필요
 
 class MealNameUpdateRequest(BaseModel):
     meal_id: int
@@ -240,3 +243,97 @@ class MealCreateRequest(BaseModel):
     meal_name: str
     time_taken: Optional[str] = None
     items: List[MealItemInput]
+
+
+# =====================================================
+# 식단 추천 피드백 루프 + 에이전트용 스키마 (최종본)
+# =====================================================
+
+
+
+
+# ----------------------
+# User Profile
+# ----------------------
+class UserProfileBase(BaseModel):
+    diet_style: str = "normal"            # "tight", "normal", "bulk"
+    cuisine_preference: str = "mixed"     # "korean", "western", "mixed"
+    allergies: Optional[list[str]] = None
+    notes: Optional[str] = None
+
+
+class UserProfileOut(UserProfileBase):
+    user_id: str
+
+    class Config:
+        from_attributes = True
+
+
+# ----------------------
+# Food Preferences
+# ----------------------
+class FoodPreferenceOut(BaseModel):
+    id: int
+    food_name: str
+    score: float
+    source: str
+
+    class Config:
+        from_attributes = True
+
+
+class FoodExclusionOut(BaseModel):
+    id: int
+    food_name: str
+    reason: str
+
+    class Config:
+        from_attributes = True
+
+
+# ----------------------
+# Meal History Item (추천용 로그)
+# ----------------------
+class UserMealHistoryItemOut(BaseModel):
+    id: int
+    food_id: Optional[int]
+    food_name: str
+    amount_g: float
+
+    calories: Optional[float]
+    protein: Optional[float]
+    fat: Optional[float]
+    carbs: Optional[float]
+
+    class Config:
+        from_attributes = True
+
+
+# ----------------------
+# Meal History (추천엔진용)
+# ----------------------
+class UserMealHistoryOut(BaseModel):
+    id: int
+    date: date
+    meal_name: str
+
+    total_calories: Optional[float]
+    total_protein: Optional[float]
+    total_carbs: Optional[float]
+    total_fat: Optional[float]
+
+    items: List[UserMealHistoryItemOut]
+
+    class Config:
+        from_attributes = True
+
+
+# =====================================================
+# 식단 피드백 (Meal Feedback)
+# =====================================================
+
+class MealFeedbackCreate(BaseModel):
+    user_id: str
+    history_id: int              # UserMealHistory.id
+    rating: int                  # -1, 0, +1
+    comment: Optional[str] = None

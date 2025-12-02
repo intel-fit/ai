@@ -20,37 +20,26 @@ def get_db():
         yield session
     finally:
         session.close()
+
+
 @router.post("/log", response_model=ExerciseLogOut)
 def create_exercise_log(log: ExerciseLogCreate, session: Session = Depends(get_db)):
+    # 1) 유저 확인
     user = session.query(db.User).get(log.user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     
+    # 2) 로그 저장
     db_log = db.ExerciseLog(**log.dict())
     session.add(db_log)
     session.commit()
     session.refresh(db_log)
 
-    # ✅ 요약 재계산 훅
+    # 3) 요약 재계산
     recompute_daily_summaries(log.user_id, log.date, session)
 
-    # 🔥 운동 후 자동 목표칼로리 갱신 추가
-    user = session.query(db.User).get(log.user_id)
-    update_daily_goal_after_exercise(user, log.date, session)
+    # 4) 목표 칼로리 자동 업데이트 (자동 일 때만)
+    update_daily_goal_after_exercise(log.user_id, log.date, session)
 
     return db_log
-
-
-@router.post("/log", response_model=ExerciseLogOut)
-def create_exercise_log(log: ExerciseLogCreate, session: Session = Depends(get_db)):
-    user = session.query(db.User).get(log.user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    db_log = db.ExerciseLog(**log.dict())
-    session.add(db_log)
-    session.commit()
-    session.refresh(db_log)
-    return db_log
-
 

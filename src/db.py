@@ -66,6 +66,13 @@ class User(Base):
 
     exercise_logs = relationship("ExerciseLog", back_populates="user")
     meal_logs = relationship("MealLog", back_populates="user", cascade="all, delete-orphan")
+    profile = relationship("UserProfile", uselist=False, back_populates="user")
+    food_preferences = relationship("UserFoodPreference", cascade="all, delete-orphan")
+    food_exclusions = relationship("UserFoodExclusion", cascade="all, delete-orphan")
+    meal_history = relationship("UserMealHistory", cascade="all, delete-orphan")
+    feedbacks = relationship("UserFeedback", cascade="all, delete-orphan")
+
+
 
 # ----------------------
 # ExerciseLog (daily)
@@ -369,6 +376,198 @@ def patch_daily_nutrition_goals_table():
                 print(f"[DB PATCH ERROR] {sql} → {e}")
 
 
+#---------------------
+#식단 추천 피드백 루프 + 에이전트 등등 추가
+#---------------------
+
+class UserProfile(Base):
+    __tablename__ = "user_profile"
+
+    user_id = Column(String, ForeignKey("users.id"), primary_key=True)
+
+    diet_style = Column(String, default="normal")
+    cuisine_preference = Column(String, default="mixed")
+
+    allergies = Column(Text, nullable=True)  # JSON string
+    notes = Column(Text, nullable=True)
+
+    user = relationship("User", back_populates="profile")
+
+    # Optional helper methods
+    def get_allergies(self):
+        if not self.allergies:
+            return []
+        try:
+            return json.loads(self.allergies)
+        except:
+            return []
+
+    def set_allergies(self, arr):
+        self.allergies = json.dumps(arr, ensure_ascii=False)
+
+
+
+class UserFoodPreference(Base):
+    __tablename__ = "user_food_preferences"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String, ForeignKey("users.id"))
+    food_name = Column(String, nullable=False)
+    score = Column(Float, default=1.0)
+    source = Column(String, default="manual")
+
+    user = relationship("User", back_populates="food_preferences")
+
+
+
+class UserFoodExclusion(Base):
+    __tablename__ = "user_food_exclusions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String, ForeignKey("users.id"))
+    food_name = Column(String, nullable=False)
+    reason = Column(String, default="taste")
+
+    user = relationship("User", back_populates="food_exclusions")
+
+
+
+class UserMealHistory(Base):
+    __tablename__ = "user_meal_history"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String, ForeignKey("users.id"))
+    date = Column(Date, nullable=False)
+    meal_name = Column(String, nullable=False)
+
+    total_calories = Column(Float)
+    total_protein = Column(Float)
+    total_carbs = Column(Float)
+    total_fat = Column(Float)
+
+    user = relationship("User", back_populates="meal_history")
+    items = relationship("UserMealHistoryItem", back_populates="history", cascade="all, delete-orphan")
+    feedbacks = relationship("UserFeedback", back_populates="history", cascade="all, delete-orphan")
+
+
+
+
+
+class UserMealHistoryItem(Base):
+    __tablename__ = "user_meal_history_items"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    history_id = Column(Integer, ForeignKey("user_meal_history.id"))
+
+    food_id = Column(Integer, nullable=True)
+    food_name = Column(String)
+    amount_g = Column(Float)
+
+    calories = Column(Float)
+    protein = Column(Float)
+    fat = Column(Float)
+    carbs = Column(Float)
+
+    history = relationship("UserMealHistory", back_populates="items")
+
+
+
+
+
+class UserFeedback(Base):
+    __tablename__ = "user_feedback"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String, ForeignKey("users.id"))
+    history_id = Column(Integer, ForeignKey("user_meal_history.id"))  # FIXED
+    rating = Column(Integer)  # -1, 0, +1
+    comment = Column(Text, nullable=True)
+
+    user = relationship("User", back_populates="feedbacks")
+    history = relationship("UserMealHistory", back_populates="feedbacks")
+
+# ===========================================
+# Weekly / Monthly Nutrition & Exercise Summary 저장 테이블
+# ===========================================
+
+class WeeklyNutritionSummary(Base):
+    __tablename__ = "weekly_nutrition_summary"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    week_start = Column(Date, index=True, nullable=False)
+    week_end = Column(Date, nullable=False)
+
+    avg_kcal = Column(Float, default=0)
+    avg_protein = Column(Float, default=0)
+    avg_fat = Column(Float, default=0)
+    avg_carb = Column(Float, default=0)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    __table_args__ = (
+        UniqueConstraint("user_id", "week_start", name="uq_weekly_nutrition_period"),
+    )
+
+
+
+class WeeklyExerciseSummary(Base):
+    __tablename__ = "weekly_exercise_summary"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    week_start = Column(Date, index=True, nullable=False)
+    week_end = Column(Date, nullable=False)
+
+    avg_duration = Column(Float, default=0)
+    avg_calories_burned = Column(Float, default=0)
+    avg_intensity = Column(Float, default=0)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    __table_args__ = (
+        UniqueConstraint("user_id", "week_start", name="uq_weekly_exercise_period"),
+    )
+
+
+
+class MonthlyNutritionSummary(Base):
+    __tablename__ = "monthly_nutrition_summary"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    month = Column(String, index=True, nullable=False)  # "YYYY-MM"
+
+    avg_kcal = Column(Float, default=0)
+    avg_protein = Column(Float, default=0)
+    avg_fat = Column(Float, default=0)
+    avg_carb = Column(Float, default=0)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    __table_args__ = (
+        UniqueConstraint("user_id", "month", name="uq_monthly_nutrition_period"),
+    )
+
+
+
+class MonthlyExerciseSummary(Base):
+    __tablename__ = "monthly_exercise_summary"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    month = Column(String, index=True, nullable=False)
+
+    avg_duration = Column(Float, default=0)
+    avg_calories_burned = Column(Float, default=0)
+    avg_intensity = Column(Float, default=0)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    __table_args__ = (
+        UniqueConstraint("user_id", "month", name="uq_monthly_exercise_period"),
+    )
+
+
+
+
+
 # ----------------------
 # init_db()
 # ----------------------
@@ -411,6 +610,34 @@ def init_db():
     # daily_nutrition_goals 패치
     if inspector.has_table("daily_nutrition_goals"):
         patch_daily_nutrition_goals_table()
+        # -------------------------------
+    # NEW — Personalized Meal System Tables
+    # -------------------------------
+    if not inspector.has_table("user_profile"):
+        UserProfile.__table__.create(bind=engine)
+
+    if not inspector.has_table("user_food_preferences"):
+        UserFoodPreference.__table__.create(bind=engine)
+
+    if not inspector.has_table("user_food_exclusions"):
+        UserFoodExclusion.__table__.create(bind=engine)
+
+    if not inspector.has_table("user_meal_history"):
+        UserMealHistory.__table__.create(bind=engine)
+
+    if not inspector.has_table("user_meal_history_items"):
+        UserMealHistoryItem.__table__.create(bind=engine)
+
+
+    if not inspector.has_table("user_feedback"):
+        UserFeedback.__table__.create(bind=engine)
+
+    # Weekly/Monthly Summary 테이블 생성
+    for table in [WeeklyNutritionSummary, WeeklyExerciseSummary,
+                MonthlyNutritionSummary, MonthlyExerciseSummary]:
+        if not inspector.has_table(table.__tablename__):
+            table.__table__.create(bind=engine)
+
 
     # MealItem time_taken 패치 호출
     patch_meal_item_time_taken()

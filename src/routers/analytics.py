@@ -8,6 +8,20 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from src import db
 import matplotlib
 import os
+from fastapi import Query
+
+from src.services.summary_storage import (
+    save_weekly_nutrition, save_weekly_exercise,
+    save_monthly_nutrition, save_monthly_exercise
+)
+# === 새로 추가된 요약 테이블 모델 import ===
+from src.db import (
+    WeeklyNutritionSummary,
+    WeeklyExerciseSummary,
+    MonthlyNutritionSummary,
+    MonthlyExerciseSummary
+)
+
 
 matplotlib.use("Agg")
 
@@ -31,6 +45,94 @@ def get_db():
         yield session
     finally:
         session.close()
+
+# ----------------------------------------------------------------------
+#  계산 함수: 주간 평균 계산 (자동 저장용)
+# ----------------------------------------------------------------------
+def compute_week_data(session, user_id, ws, we):
+    merged = _get_merged_daily_summaries(session, user_id, ws, we)
+
+    nut_kcal, nut_prot, nut_fat, nut_carb = [], [], [], []
+    ex_dur, ex_cal, ex_int = [], [], []
+
+    for i in range(7):
+        d = ws + timedelta(days=i)
+        day_data = merged.get(d, {})
+        nut = day_data.get("nutrition")
+        ex = day_data.get("exercise")
+
+        if nut:
+            nut_kcal.append(nut.get("kcal", 0))
+            nut_prot.append(nut.get("protein_g", 0))
+            nut_fat.append(nut.get("fat_g", 0))
+            nut_carb.append(nut.get("carb_g", 0))
+        if ex:
+            ex_dur.append(ex.get("duration_min", 0))
+            ex_cal.append(ex.get("calories_burned", 0))
+            ex_int.append(ex.get("avg_intensity", 0))
+
+    def avg(lst): return sum(lst) / len(lst) if lst else 0
+
+    nut = {
+        "kcal": avg(nut_kcal),
+        "protein": avg(nut_prot),
+        "fat": avg(nut_fat),
+        "carb": avg(nut_carb),
+    }
+
+    ex = {
+        "duration_min": avg(ex_dur),
+        "calories_burned": avg(ex_cal),
+        "avg_intensity": avg(ex_int),
+    }
+
+    return nut, ex
+
+# ----------------------------------------------------------------------
+#  Weekly Summary 저장 + 조회 wrapper
+# ----------------------------------------------------------------------
+def get_or_compute_weekly_summary(session, user_id, ws, we):
+    """
+    저장된 값이 있으면 반환,
+    없으면 계산 후 저장하고 반환
+    """
+
+    row_n = session.query(WeeklyNutritionSummary).filter(
+        WeeklyNutritionSummary.user_id == user_id,
+        WeeklyNutritionSummary.week_start == ws
+    ).first()
+
+    row_e = session.query(WeeklyExerciseSummary).filter(
+        WeeklyExerciseSummary.user_id == user_id,
+        WeeklyExerciseSummary.week_start == ws
+    ).first()
+
+    if row_n and row_e:
+        return {
+            "nutrition": {
+                "kcal": row_n.avg_kcal,
+                "protein": row_n.avg_protein,
+                "fat": row_n.avg_fat,
+                "carb": row_n.avg_carb,
+            },
+            "exercise": {
+                "duration_min": row_e.avg_duration,
+                "calories_burned": row_e.avg_calories_burned,
+                "avg_intensity": row_e.avg_intensity,
+            }
+        }
+
+    # 저장된 게 없으면 계산
+    nut, ex = compute_week_data(session, user_id, ws, we)
+
+    # 저장
+    save_weekly_nutrition(session, user_id, ws, we, nut)
+    save_weekly_exercise(session, user_id, ws, we, ex)
+
+    return {
+        "nutrition": nut,
+        "exercise": ex,
+    }
 
 
 # ----------------------------------------
@@ -174,83 +276,33 @@ def get_week_daily_summary(user_id: str, session: Session = Depends(get_db)):
 # ==========================================================
 @router.get("/analytics/weekly/{user_id}", response_class=JSONResponse)
 def get_4weeks_summary(user_id: str, session: Session = Depends(get_db)):
-    """
-    최근 4주에 대해,
-    각 주(월~일)의 평균 영양/운동 정보를 반환.
-    """
+
     today = date.today()
     current_monday = today - timedelta(days=today.weekday())
 
-    # 최근 4주 (주 시작일 리스트)
     week_starts = [current_monday - timedelta(days=7 * i) for i in range(4)]
-    week_starts.sort()  # 오래된 주부터 최신 주
+    week_starts.sort()
 
     weekly_summary = []
 
     for ws in week_starts:
         we = ws + timedelta(days=6)
-        merged = _get_merged_daily_summaries(session, user_id, ws, we)
 
-        nut_kcal = []
-        nut_prot = []
-        nut_fat = []
-        nut_carb = []
+        # 👇 여기서 “DB 캐싱 + 없으면 계산 + 저장” 적용됨
+        result = get_or_compute_weekly_summary(session, user_id, ws, we)
 
-        ex_dur = []
-        ex_cal = []
-        ex_int = []
+        weekly_summary.append({
+            "week_start": ws.isoformat(),
+            "week_end": we.isoformat(),
+            "nutrition_avg": result["nutrition"],
+            "exercise_avg": result["exercise"]
+        })
 
-        for i in range(7):
-            d = ws + timedelta(days=i)
-            day_data = merged.get(d, {})
-            nut = day_data.get("nutrition")
-            ex = day_data.get("exercise")
-
-            if nut:
-                nut_kcal.append(nut.get("kcal", 0))
-                nut_prot.append(nut.get("protein_g", 0))
-                nut_fat.append(nut.get("fat_g", 0))
-                nut_carb.append(nut.get("carb_g", 0))
-
-            if ex:
-                ex_dur.append(ex.get("duration_min", 0))
-                ex_cal.append(ex.get("calories_burned", 0))
-                ex_int.append(ex.get("avg_intensity", 0))
-
-        if not nut_kcal and not ex_dur:
-            continue
-
-        def avg(lst):
-            return sum(lst) / len(lst) if lst else 0
-
-        weekly_summary.append(
-            {
-                "week_start": ws.isoformat(),
-                "week_end": we.isoformat(),
-                "nutrition_avg": {
-                    "kcal": round(avg(nut_kcal), 1),
-                    "protein_g": round(avg(nut_prot), 1),
-                    "fat_g": round(avg(nut_fat), 1),
-                    "carb_g": round(avg(nut_carb), 1),
-                },
-                "exercise_avg": {
-                    "duration_min": round(avg(ex_dur), 1),
-                    "calories_burned": round(avg(ex_cal), 1),
-                    "avg_intensity": round(avg(ex_int), 2),
-                },
-            }
-        )
-
-    if not weekly_summary:
-        raise HTTPException(status_code=404, detail="No weekly data in last 4 weeks")
-
-    return JSONResponse(
-        content={
-            "user_id": user_id,
-            "weeks_count": len(weekly_summary),
-            "weekly_summary": weekly_summary,
-        }
-    )
+    return JSONResponse(content={
+        "user_id": user_id,
+        "weeks_count": len(weekly_summary),
+        "weekly_summary": weekly_summary,
+    })
 
 
 # ==========================================================
@@ -258,11 +310,6 @@ def get_4weeks_summary(user_id: str, session: Session = Depends(get_db)):
 # ==========================================================
 @router.get("/analytics/monthly/{user_id}", response_class=JSONResponse)
 def get_3months_summary(user_id: str, session: Session = Depends(get_db)):
-    """
-    최근 3개월에 대해,
-    각 달의 평균 영양/운동 정보를 반환.
-    (달 단위: 1일 ~ 말일)
-    """
     today = date.today()
     this_month_start = today.replace(day=1)
 
@@ -270,32 +317,58 @@ def get_3months_summary(user_id: str, session: Session = Depends(get_db)):
         last_day_prev = d - timedelta(days=1)
         return last_day_prev.replace(day=1)
 
+    # 최근 3개월 시작일 계산
     month_starts = [this_month_start]
     for _ in range(2):
         month_starts.append(prev_month_start(month_starts[-1]))
     month_starts.sort()
 
-    monthly_summary = []
+    results = []
 
     for ms in month_starts:
-        # 다음 달 1일
         next_month = (ms.replace(day=28) + timedelta(days=4)).replace(day=1)
         me = next_month - timedelta(days=1)
+        month_str = ms.strftime("%Y-%m")
 
+        # ---- DB 캐싱 체크 ----
+        row_n = session.query(MonthlyNutritionSummary).filter(
+            MonthlyNutritionSummary.user_id == user_id,
+            MonthlyNutritionSummary.month == month_str
+        ).first()
+
+        row_e = session.query(MonthlyExerciseSummary).filter(
+            MonthlyExerciseSummary.user_id == user_id,
+            MonthlyExerciseSummary.month == month_str
+        ).first()
+
+        if row_n and row_e:
+            # 저장된 데이터 이용
+            results.append(
+                {
+                    "month": month_str,
+                    "period": f"{ms.isoformat()} ~ {me.isoformat()}",
+                    "nutrition_avg": {
+                        "kcal": row_n.avg_kcal,
+                        "protein_g": row_n.avg_protein,
+                        "fat_g": row_n.avg_fat,
+                        "carb_g": row_n.avg_carb,
+                    },
+                    "exercise_avg": {
+                        "duration_min": row_e.avg_duration,
+                        "calories_burned": row_e.avg_calories_burned,
+                        "avg_intensity": row_e.avg_intensity,
+                    }
+                }
+            )
+            continue
+
+        # ---- 저장된 데이터 없으면 계산 ----
         merged = _get_merged_daily_summaries(session, user_id, ms, me)
 
-        nut_kcal = []
-        nut_prot = []
-        nut_fat = []
-        nut_carb = []
+        nut_kcal, nut_prot, nut_fat, nut_carb = [], [], [], []
+        ex_dur, ex_cal, ex_int = [], [], []
 
-        ex_dur = []
-        ex_cal = []
-        ex_int = []
-
-        for d, day_data in merged.items():
-            if not (ms <= d <= me):
-                continue
+        for _, day_data in merged.items():
             nut = day_data.get("nutrition")
             ex = day_data.get("exercise")
             if nut:
@@ -308,38 +381,41 @@ def get_3months_summary(user_id: str, session: Session = Depends(get_db)):
                 ex_cal.append(ex.get("calories_burned", 0))
                 ex_int.append(ex.get("avg_intensity", 0))
 
-        if not nut_kcal and not ex_dur:
-            continue
+        def avg(lst): return sum(lst) / len(lst) if lst else 0
 
-        def avg(lst):
-            return sum(lst) / len(lst) if lst else 0
+        # 계산 결과
+        nut_result = {
+            "kcal": round(avg(nut_kcal), 1),
+            "protein": round(avg(nut_prot), 1),
+            "fat": round(avg(nut_fat), 1),
+            "carb": round(avg(nut_carb), 1),
+        }
 
-        monthly_summary.append(
+        ex_result = {
+            "duration_min": round(avg(ex_dur), 1),
+            "calories_burned": round(avg(ex_cal), 1),
+            "avg_intensity": round(avg(ex_int), 2),
+        }
+
+        # ---- DB 저장 ----
+        save_monthly_nutrition(session, user_id, month_str, nut_result)
+        save_monthly_exercise(session, user_id, month_str, ex_result)
+
+        # API 출력에 추가
+        results.append(
             {
-                "month": ms.strftime("%Y-%m"),
+                "month": month_str,
                 "period": f"{ms.isoformat()} ~ {me.isoformat()}",
-                "nutrition_avg": {
-                    "kcal": round(avg(nut_kcal), 1),
-                    "protein_g": round(avg(nut_prot), 1),
-                    "fat_g": round(avg(nut_fat), 1),
-                    "carb_g": round(avg(nut_carb), 1),
-                },
-                "exercise_avg": {
-                    "duration_min": round(avg(ex_dur), 1),
-                    "calories_burned": round(avg(ex_cal), 1),
-                    "avg_intensity": round(avg(ex_int), 2),
-                },
+                "nutrition_avg": nut_result,
+                "exercise_avg": ex_result,
             }
         )
-
-    if not monthly_summary:
-        raise HTTPException(status_code=404, detail="No monthly data in last 3 months")
 
     return JSONResponse(
         content={
             "user_id": user_id,
-            "months_count": len(monthly_summary),
-            "monthly_summary": monthly_summary,
+            "months_count": len(results),
+            "monthly_summary": results,
         }
     )
 
@@ -799,5 +875,384 @@ def nutrition4_monthly_graph(user_id: str, session: Session = Depends(get_db)):
         title=f"{user_id} — 최근 3개월 영양 4종 평균",
         xlabel="월",
         ylabel="값 (kcal / g)",
+    )
+    return StreamingResponse(buf, media_type="image/png")
+
+
+@router.get("/analytics/period/{user_id}", response_class=JSONResponse)
+def get_period_summary(
+    user_id: str,
+    start_date: date = Query(..., description="YYYY-MM-DD"),
+    end_date: date = Query(..., description="YYYY-MM-DD"),
+    session: Session = Depends(get_db),
+):
+    if end_date < start_date:
+        raise HTTPException(status_code=400, detail="end_date must be >= start_date")
+
+    merged = _get_merged_daily_summaries(session, user_id, start_date, end_date)
+
+    results = []
+    for d in sorted(merged.keys()):
+        results.append({
+            "date": d.isoformat(),
+            "nutrition": merged[d].get("nutrition", {}),
+            "exercise": merged[d].get("exercise", {}),
+        })
+
+    return JSONResponse(
+        content={
+            "user_id": user_id,
+            "range": f"{start_date.isoformat()} ~ {end_date.isoformat()}",
+            "days": results,
+        }
+    )
+
+@router.get("/analytics/custom/weekly/{user_id}", response_class=JSONResponse)
+def get_custom_weeks(
+    user_id: str,
+    weeks: int = Query(4, ge=1, le=52),
+    session: Session = Depends(get_db),
+):
+    today = date.today()
+    current_monday = today - timedelta(days=today.weekday())
+
+    week_starts = [current_monday - timedelta(days=7 * i) for i in range(weeks)]
+    week_starts.sort()
+
+    summaries = []
+
+    for ws in week_starts:
+        we = ws + timedelta(days=6)
+        result = get_or_compute_weekly_summary(session, user_id, ws, we)
+
+        summaries.append({
+            "week_start": ws.isoformat(),
+            "week_end": we.isoformat(),
+            "nutrition_avg": result["nutrition"],
+            "exercise_avg": result["exercise"]
+        })
+
+    return JSONResponse(
+        content={
+            "user_id": user_id,
+            "weeks_requested": weeks,
+            "weekly_summary": summaries
+        }
+    )
+
+
+@router.get("/analytics/custom/monthly/{user_id}", response_class=JSONResponse)
+def get_custom_months(
+    user_id: str,
+    months: int = Query(3, ge=1, le=24),
+    session: Session = Depends(get_db)
+):
+    today = date.today()
+    this_month_start = today.replace(day=1)
+
+    def prev_month_start(d):
+        last = d - timedelta(days=1)
+        return last.replace(day=1)
+
+    month_starts = [this_month_start]
+    for _ in range(months - 1):
+        month_starts.append(prev_month_start(month_starts[-1]))
+
+    month_starts.sort()
+
+    results = []
+
+    for ms in month_starts:
+        next_month = (ms.replace(day=28) + timedelta(days=4)).replace(day=1)
+        me = next_month - timedelta(days=1)
+        month_str = ms.strftime("%Y-%m")
+
+        # 캐싱 체크
+        row_n = session.query(MonthlyNutritionSummary).filter(
+            MonthlyNutritionSummary.user_id == user_id,
+            MonthlyNutritionSummary.month == month_str
+        ).first()
+
+        row_e = session.query(MonthlyExerciseSummary).filter(
+            MonthlyExerciseSummary.user_id == user_id,
+            MonthlyExerciseSummary.month == month_str
+        ).first()
+
+        if row_n and row_e:
+            nut = {
+                "kcal": row_n.avg_kcal,
+                "protein": row_n.avg_protein,
+                "fat": row_n.avg_fat,
+                "carb": row_n.avg_carb,
+            }
+            ex = {
+                "duration_min": row_e.avg_duration,
+                "calories_burned": row_e.avg_calories_burned,
+                "avg_intensity": row_e.avg_intensity,
+            }
+        else:
+            merged = _get_merged_daily_summaries(session, user_id, ms, me)
+
+            nut_kcal, nut_prot, nut_fat, nut_carb = [], [], [], []
+            ex_dur, ex_cal, ex_int = [], [], []
+
+            for _, day_data in merged.items():
+                nut = day_data.get("nutrition")
+                ex = day_data.get("exercise")
+                if nut:
+                    nut_kcal.append(nut.get("kcal", 0))
+                    nut_prot.append(nut.get("protein_g", 0))
+                    nut_fat.append(nut.get("fat_g", 0))
+                    nut_carb.append(nut.get("carb_g", 0))
+                if ex:
+                    ex_dur.append(ex.get("duration_min", 0))
+                    ex_cal.append(ex.get("calories_burned", 0))
+                    ex_int.append(ex.get("avg_intensity", 0))
+
+            def avg(lst): return sum(lst) / len(lst) if lst else 0
+
+            nut = {
+                "kcal": avg(nut_kcal),
+                "protein": avg(nut_prot),
+                "fat": avg(nut_fat),
+                "carb": avg(nut_carb),
+            }
+            ex = {
+                "duration_min": avg(ex_dur),
+                "calories_burned": avg(ex_cal),
+                "avg_intensity": avg(ex_int),
+            }
+
+            save_monthly_nutrition(session, user_id, month_str, nut)
+            save_monthly_exercise(session, user_id, month_str, ex)
+
+        results.append({
+            "month": month_str,
+            "nutrition_avg": nut,
+            "exercise_avg": ex,
+        })
+
+    return JSONResponse(
+        content={
+            "user_id": user_id,
+            "months_requested": months,
+            "monthly_summary": results
+        }
+    )
+
+
+@router.get("/analytics/custom/weekly-graph/nutrition/{user_id}")
+def custom_weekly_graph_nutrition(
+    user_id: str, 
+    weeks: int = Query(4, ge=1, le=52),
+    session: Session = Depends(get_db),
+):
+    today = date.today()
+    current_monday = today - timedelta(days=today.weekday())
+
+    week_starts = [current_monday - timedelta(days=7 * i) for i in range(weeks)]
+    week_starts.sort()
+
+    labels, kcal_avg, protein_avg, fat_avg, carb_avg = [], [], [], [], []
+
+    for ws in week_starts:
+        we = ws + timedelta(days=6)
+
+        result = get_or_compute_weekly_summary(session, user_id, ws, we)
+        nut = result.get("nutrition", {})
+
+        labels.append(ws.strftime("%m-%d"))
+        kcal_avg.append(nut.get("kcal", 0))
+        protein_avg.append(nut.get("protein", 0))
+        fat_avg.append(nut.get("fat", 0))
+        carb_avg.append(nut.get("carb", 0))
+
+    buf = _plot_lines(
+        labels,
+        {
+            "칼로리(kcal)": kcal_avg,
+            "단백질(g)": protein_avg,
+            "지방(g)": fat_avg,
+            "탄수화물(g)": carb_avg,
+        },
+        title=f"{user_id} — 최근 {weeks}주 영양 평균",
+        xlabel="주 시작일",
+        ylabel="값 (kcal / g)",
+    )
+    return StreamingResponse(buf, media_type="image/png")
+
+
+@router.get("/analytics/custom/weekly-graph/exercise/{user_id}")
+def custom_weekly_graph_exercise(
+    user_id: str, 
+    weeks: int = Query(4, ge=1, le=52),
+    session: Session = Depends(get_db),
+):
+    today = date.today()
+    current_monday = today - timedelta(days=today.weekday())
+
+    week_starts = [current_monday - timedelta(days=7 * i) for i in range(weeks)]
+    week_starts.sort()
+
+    labels, duration_avg, kcal_out_avg, intensity_avg = [], [], [], []
+
+    for ws in week_starts:
+        we = ws + timedelta(days=6)
+
+        result = get_or_compute_weekly_summary(session, user_id, ws, we)
+        ex = result.get("exercise", {})
+
+        labels.append(ws.strftime("%m-%d"))
+        duration_avg.append(ex.get("duration_min", 0))
+        kcal_out_avg.append(ex.get("calories_burned", 0))
+        intensity_avg.append(ex.get("avg_intensity", 0))
+
+    buf = _plot_lines(
+        labels,
+        {
+            "운동시간(min)": duration_avg,
+            "운동소모칼로리(kcal)": kcal_out_avg,
+            "운동강도(score)": intensity_avg,
+        },
+        title=f"{user_id} — 최근 {weeks}주 운동 평균",
+        xlabel="주 시작일",
+        ylabel="값",
+    )
+    return StreamingResponse(buf, media_type="image/png")
+
+
+@router.get("/analytics/custom/monthly-graph/nutrition/{user_id}")
+def custom_monthly_graph_nutrition(
+    user_id: str,
+    months: int = Query(3, ge=1, le=24),
+    session: Session = Depends(get_db),
+):
+    results = get_custom_months(user_id, months, session).body["monthly_summary"]
+
+    labels = []
+    kcal_avg = []
+    protein_avg = []
+    fat_avg = []
+    carb_avg = []
+
+    for row in results:
+        labels.append(row["month"])
+        nut = row["nutrition_avg"]
+        kcal_avg.append(nut.get("kcal", 0))
+        protein_avg.append(nut.get("protein", 0))
+        fat_avg.append(nut.get("fat", 0))
+        carb_avg.append(nut.get("carb", 0))
+
+    buf = _plot_lines(
+        labels,
+        {
+            "칼로리(kcal)": kcal_avg,
+            "단백질(g)": protein_avg,
+            "지방(g)": fat_avg,
+            "탄수화물(g)": carb_avg,
+        },
+        title=f"{user_id} — 최근 {months}개월 영양 평균",
+        xlabel="월",
+        ylabel="값 (kcal / g)",
+    )
+    return StreamingResponse(buf, media_type="image/png")
+
+
+@router.get("/analytics/custom/monthly-graph/exercise/{user_id}")
+def custom_monthly_graph_exercise(
+    user_id: str,
+    months: int = Query(3, ge=1, le=24),
+    session: Session = Depends(get_db),
+):
+    results = get_custom_months(user_id, months, session).body["monthly_summary"]
+
+    labels = []
+    duration_avg = []
+    kcal_out_avg = []
+    intensity_avg = []
+
+    for row in results:
+        labels.append(row["month"])
+        ex = row["exercise_avg"]
+        duration_avg.append(ex.get("duration_min", 0))
+        kcal_out_avg.append(ex.get("calories_burned", 0))
+        intensity_avg.append(ex.get("avg_intensity", 0))
+
+    buf = _plot_lines(
+        labels,
+        {
+            "운동시간(min)": duration_avg,
+            "운동소모칼로리(kcal)": kcal_out_avg,
+            "운동강도(score)": intensity_avg,
+        },
+        title=f"{user_id} — 최근 {months}개월 운동 평균",
+        xlabel="월",
+        ylabel="값",
+    )
+    return StreamingResponse(buf, media_type="image/png")
+
+
+@router.get("/analytics/custom/period-graph/nutrition/{user_id}")
+def custom_period_graph_nutrition(
+    user_id: str,
+    start_date: date = Query(...),
+    end_date: date = Query(...),
+    session: Session = Depends(get_db)
+):
+    merged = _get_merged_daily_summaries(session, user_id, start_date, end_date)
+
+    labels, kcal, protein, fat, carb = [], [], [], [], []
+
+    for d in sorted(merged.keys()):
+        nut = merged[d].get("nutrition", {})
+        labels.append(d.strftime("%m-%d"))
+        kcal.append(nut.get("kcal", 0))
+        protein.append(nut.get("protein_g", 0))
+        fat.append(nut.get("fat_g", 0))
+        carb.append(nut.get("carb_g", 0))
+
+    buf = _plot_lines(
+        labels,
+        {
+            "칼로리(kcal)": kcal,
+            "단백질(g)": protein,
+            "지방(g)": fat,
+            "탄수화물(g)": carb,
+        },
+        title=f"{user_id} — {start_date} ~ {end_date} 영양 트렌드",
+        xlabel="날짜",
+        ylabel="값 (kcal / g)",
+    )
+    return StreamingResponse(buf, media_type="image/png")
+
+
+@router.get("/analytics/custom/period-graph/exercise/{user_id}")
+def custom_period_graph_exercise(
+    user_id: str,
+    start_date: date = Query(...),
+    end_date: date = Query(...),
+    session: Session = Depends(get_db)
+):
+    merged = _get_merged_daily_summaries(session, user_id, start_date, end_date)
+
+    labels, duration, kcal_out, intensity = [], [], [], []
+
+    for d in sorted(merged.keys()):
+        ex = merged[d].get("exercise", {})
+        labels.append(d.strftime("%m-%d"))
+        duration.append(ex.get("duration_min", 0))
+        kcal_out.append(ex.get("calories_burned", 0))
+        intensity.append(ex.get("avg_intensity", 0))
+
+    buf = _plot_lines(
+        labels,
+        {
+            "운동시간(min)": duration,
+            "운동소모칼로리(kcal)": kcal_out,
+            "운동강도(score)": intensity,
+        },
+        title=f"{user_id} — {start_date} ~ {end_date} 운동 트렌드",
+        xlabel="날짜",
+        ylabel="값",
     )
     return StreamingResponse(buf, media_type="image/png")

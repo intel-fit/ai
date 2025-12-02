@@ -1,4 +1,5 @@
 # src/services/ai_meal_generator_gemini.py
+
 import os
 import json
 import requests
@@ -23,6 +24,7 @@ def generate_realistic_meal_plan(
     meals_per_day: int = 3,
     preferred_foods: list[str] | None = None,
     excluded_foods: list[str] | None = None,
+    candidate_foods: list[dict] | None = None,   # ✅ 새로 추가
 ):
     """
     현실적인 식단을 Gemini 2.0 Flash 모델로 생성합니다.
@@ -32,6 +34,24 @@ def generate_realistic_meal_plan(
     # 선호 / 비선호 텍스트 구성
     prefer_text = ", ".join(preferred_foods or []) or "없음"
     exclude_text = ", ".join(excluded_foods or []) or "없음"
+
+    # 후보 음식 리스트 텍스트 구성 (점수 엔진에서 올라온 상위 음식들)
+    if candidate_foods:
+        lines = []
+        # 너무 길어지지 않도록 상위 50개만 사용
+        for c in candidate_foods[:50]:
+            name = c.get("name", "이름없음")
+            kcal = c.get("calories", 0.0)
+            protein = c.get("protein", 0.0)
+            fat = c.get("fat", 0.0)
+            carbs = c.get("carbs", 0.0)
+            score = c.get("score", 0.0)
+            lines.append(
+                f"- {name} (약 {kcal:.0f}kcal, 단백질 {protein:.1f}g, 지방 {fat:.1f}g, 탄수화물 {carbs:.1f}g, 건강점수 {score:.1f})"
+            )
+        candidates_text = "\n".join(lines)
+    else:
+        candidates_text = "별도 후보 리스트 없음 (일반적인 건강식 위주로 구성하세요.)"
 
     # ----------------------------------------------------------
     # 🧠 프롬프트 구성
@@ -55,6 +75,13 @@ def generate_realistic_meal_plan(
 
     [사용자 비선호 음식 및 제외할 재료]
     {exclude_text}
+
+    [추천 후보 음식 리스트]
+    {candidates_text}
+
+    가능하면 위의 후보 음식들만 사용해서 식단을 구성하세요.
+    특히 건강점수가 높은 음식들을 우선 사용하고,
+    후보에 없는 음식 이름은 가급적 사용하지 마세요.
 
     [식단 구성 규칙]
     1. 현실적으로 구할 수 있는 식재료를 사용하세요. (닭가슴살, 연어, 계란, 현미밥 등)
